@@ -55,7 +55,7 @@ pub const PeerConnection = struct {
         var handshake_buffer: [68]u8 = undefined;
         handshake_buffer[0] = 19; // Protocol identifier length
         @memcpy(handshake_buffer[1..20], "BitTorrent protocol"); // Protocol identifier
-        std.mem.set(u8, handshake_buffer[20..28], 0); // Reserved bytes
+        @memset(handshake_buffer[20..28], 0); // Reserved bytes
         @memcpy(handshake_buffer[28..48], &self.info_hash); // Info hash
         @memcpy(handshake_buffer[48..68], &self.peer_id); // Peer ID
 

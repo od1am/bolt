@@ -77,8 +77,8 @@ pub const PieceManager = struct {
         const piece_size = if (piece_index == self.total_pieces - 1) blk: {
             const total_size = self.piece_length * self.total_pieces;
             const remaining = total_size - (piece_index * self.piece_length);
-            break :blk @as(u32, @min(remaining, self.piece_length));
-        } else self.piece_length;
+            break :blk @as(u32, @min(@as(u32, @intCast(remaining)), @as(u32, @intCast(self.piece_length))));
+        } else @as(u32, @intCast(self.piece_length));
 
         std.debug.print("Requesting piece {} (size: {})\n", .{ piece_index, piece_size });
 

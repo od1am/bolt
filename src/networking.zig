@@ -44,10 +44,10 @@ pub const PeerManager = struct {
 
     // Connect to a peer and add it to the list
     pub fn connectToPeer(self: *PeerManager, address: net.Address) !void {
-        const ip = try std.fmt.allocPrint(self.allocator, "{}", .{address.getIp()});
-        defer self.allocator.free(ip);
-
-        std.debug.print("Attempting to connect to peer {s}:{}\n", .{ ip, address.getPort() });
+        var ip_buf: [100]u8 = undefined;
+        const ip = try std.fmt.bufPrint(&ip_buf, "{}", .{address});
+        
+        std.debug.print("Attempting to connect to peer {s}\n", .{ip});
 
         const socket = try net.tcpConnectToAddress(address);
         errdefer socket.close();
@@ -62,7 +62,7 @@ pub const PeerManager = struct {
         std.debug.print("Performing handshake with peer...\n", .{});
         try peer.handshake();
         try self.peers.append(peer);
-        std.debug.print("Successfully connected to peer {s}:{}\n", .{ ip, address.getPort() });
+        std.debug.print("Successfully connected to peer {s}\n", .{ip});
     }
 
     // Start downloading pieces from all connected peers
@@ -143,7 +143,7 @@ pub fn parseCompactPeers(allocator: Allocator, data: []const u8) ![]net.Address 
     var i: usize = 0;
     while (i + 6 <= data.len) {
         const ip = data[i..][0..4];
-        const port = std.mem.readIntBig(u16, data[i + 4 ..][0..2]);
+        const port = std.mem.readInt(u16, data[i + 4 ..][0..2], .big);
         const address = try net.Address.parseIp4(ip, port);
         try peers.append(address);
         i += 6;
