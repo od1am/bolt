@@ -3,14 +3,13 @@ const Allocator = std.mem.Allocator;
 const BencodeValue = @import("bencode.zig").BencodeValue;
 const StringArrayHashMap = std.StringArrayHashMap;
 
-// Struct to represent the torrent file metadata
 pub const TorrentFile = struct {
-    announce: []const u8, // Tracker URL
-    info: InfoDict, // Info dictionary from the torrent file
-    info_raw: []const u8, // Raw bencoded info dictionary
+    announce_url: []const u8, 
+    info: InfoDict, 
+    info_raw: []const u8, 
 
     pub fn deinit(self: *TorrentFile, allocator: Allocator) void {
-        allocator.free(self.announce);
+        allocator.free(self.announce_url);
         self.info.deinit(allocator);
         allocator.free(self.info_raw);
     }
@@ -22,13 +21,12 @@ pub const TorrentFile = struct {
     }
 };
 
-// Struct to represent the 'info' dictionary in the torrent file
 pub const InfoDict = struct {
-    name: []const u8, // Name of the torrent
-    piece_length: usize, // Size of each piece in bytes
-    pieces: []const u8, // Concatenated SHA-1 hashes of pieces
-    length: ?usize, // Total size of the file (single-file torrent)
-    files: ?[]File, // List of files (multi-file torrent)
+    name: []const u8, 
+    piece_length: usize, 
+    pieces: []const u8, 
+    length: ?usize, 
+    files: ?[]File, 
 
     pub fn deinit(self: *InfoDict, allocator: Allocator) void {
         allocator.free(self.name);
@@ -42,17 +40,15 @@ pub const InfoDict = struct {
     }
 };
 
-// Struct to represent a file in a multi-file torrent
 pub const File = struct {
-    path: []const u8, // Path to the file
-    length: usize, // Size of the file in bytes
+    path: []const u8, 
+    length: usize, 
 
     pub fn deinit(self: *File, allocator: Allocator) void {
         allocator.free(self.path);
     }
 };
 
-// Parse the torrent file from Bencoded data
 pub fn parseTorrentFile(allocator: Allocator, data: []const u8) !TorrentFile {
     const bencode = @import("bencode.zig");
     var bencode_value = try bencode.parse(allocator, data);
@@ -66,13 +62,12 @@ pub fn parseTorrentFile(allocator: Allocator, data: []const u8) !TorrentFile {
     const info_dict = try extractInfoDict(allocator, info_value);
 
     return TorrentFile{
-        .announce = announce,
+        .announce_url = announce,
         .info = info_dict,
         .info_raw = info_raw,
     };
 }
 
-// Extract the 'info' dictionary from the Bencoded value
 fn extractInfoDict(allocator: Allocator, info_value: BencodeValue) !InfoDict {
     if (info_value != .dict) return error.InvalidFormat;
 
@@ -99,7 +94,6 @@ fn extractInfoDict(allocator: Allocator, info_value: BencodeValue) !InfoDict {
     };
 }
 
-// Extract a list of files from the Bencoded value
 fn extractFiles(allocator: Allocator, files_list: []BencodeValue) ![]File {
     var files = try allocator.alloc(File, files_list.len);
     for (files_list, 0..) |file_value, i| {
@@ -111,28 +105,24 @@ fn extractFiles(allocator: Allocator, files_list: []BencodeValue) ![]File {
     return files;
 }
 
-// Extract a string from the Bencoded dictionary
 fn extractString(allocator: Allocator, dict: StringArrayHashMap(BencodeValue), key: []const u8) ![]const u8 {
     const value = dict.get(key) orelse return error.InvalidFormat;
     if (value != .string) return error.InvalidFormat;
     return try allocator.dupe(u8, value.string);
 }
 
-// Extract an integer from the Bencoded dictionary
 fn extractInteger(dict: StringArrayHashMap(BencodeValue), key: []const u8) !usize {
     const value = dict.get(key) orelse return error.InvalidFormat;
     if (value != .integer) return error.InvalidFormat;
     return @intCast(value.integer);
 }
 
-// Calculate the SHA-1 info hash of the 'info' dictionary
 pub fn calculateInfoHash(_: Allocator, info_raw: []const u8) ![20]u8 {
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(info_raw);
     return hasher.finalResult();
 }
 
-// Serialize a BencodeValue to a byte array
 fn serializeBencodeValue(allocator: Allocator, value: BencodeValue) ![]const u8 {
     var buffer = std.ArrayList(u8).init(allocator);
     defer buffer.deinit();
@@ -140,7 +130,6 @@ fn serializeBencodeValue(allocator: Allocator, value: BencodeValue) ![]const u8 
     return buffer.toOwnedSlice();
 }
 
-// Helper function to serialize BencodeValue
 fn serializeValue(buffer: *std.ArrayList(u8), value: BencodeValue) !void {
     switch (value) {
         .integer => |num| try buffer.writer().print("i{}e", .{num}),

@@ -18,31 +18,12 @@ pub fn requestPeers(allocator: Allocator, torrent_file: *const torrent.TorrentFi
     const tracker_url = try buildTrackerUrl(allocator, torrent_file, peer_id, port);
     defer allocator.free(tracker_url);
 
-    const response = sendHttpRequest(allocator, tracker_url) catch |err| {
-        if (torrent_file.announce_list == null or torrent_file.announce_list.?.len == 0) return err;
-        
-        std.debug.print("Trying backup trackers...\n", .{});
-        for (torrent_file.announce_list.?) |announce| {
-            const backup_url = try buildTrackerUrlWithAnnounce(allocator, announce, torrent_file, peer_id, port);
-            defer allocator.free(backup_url);
-            
-            if (sendHttpRequest(allocator, backup_url)) |resp| {
-                return resp;
-            } else |backup_err| {
-                std.debug.print("Backup tracker failed: {}\n", .{backup_err});
-                continue;
-            }
-        }
-        return err;
-    };
-
-    return response;
+    return try sendHttpRequest(allocator, tracker_url);
 }
 
 fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
     const uri = try std.Uri.parse(url);
 
-    // Validate URI
     if (uri.host == null) return error.InvalidUrl;
 
     var port: u16 = 80;
@@ -59,11 +40,9 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
 
     std.debug.print("Connecting to tracker: {s}://{s}:{}\n", .{ uri.scheme, host_str, port });
 
-    // Create socket
     const socket = try std.net.tcpConnectToHost(allocator, host_str, port);
     defer socket.close();
 
-    // Build HTTP request
     const path = if (uri.path.percent_encoded.len > 0) uri.path.percent_encoded else "/";
     const query = if (uri.query) |q| q.percent_encoded else "";
 
@@ -88,10 +67,8 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
 
     std.debug.print("Sending HTTP request:\n{s}\n", .{request});
 
-    // Send request
     _ = try socket.writeAll(request); // Changed from write to writeAll
 
-    // Read response
     var buffer = try allocator.alloc(u8, 16 * 1024); // 16KB buffer
     defer allocator.free(buffer);
 
@@ -105,12 +82,10 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
 
         total_read += bytes_read;
 
-        // Check if we've found the end of headers
         if (content_start == null) {
             if (std.mem.indexOf(u8, buffer[0..total_read], "\r\n\r\n")) |header_end| {
                 content_start = header_end + 4;
 
-                // Parse headers to find content length
                 const headers = buffer[0..header_end];
                 if (std.mem.indexOf(u8, headers, "Content-Length:")) |cl_pos| {
                     var end_pos = std.mem.indexOf(u8, headers[cl_pos..], "\r\n") orelse headers.len;
@@ -121,12 +96,10 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
             }
         }
 
-        // Check if we need to resize the buffer
         if (total_read >= buffer.len - 1024) {
             buffer = try allocator.realloc(buffer, buffer.len * 2);
         }
 
-        // Check if we've read the full content
         if (content_start != null and content_length != null) {
             if (total_read >= content_start.? + content_length.?) {
                 break;
@@ -134,7 +107,6 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
         }
     }
 
-    // Check for HTTP status code
     const status_line_end = std.mem.indexOf(u8, buffer[0..total_read], "\r\n") orelse return error.InvalidHttpResponse;
     const status_line = buffer[0..status_line_end];
 
@@ -145,42 +117,39 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
         return error.TrackerRequestFailed;
     }
 
-    // Extract body
     if (content_start == null) return error.InvalidHttpResponse;
 
     const body = buffer[content_start.?..total_read];
     std.debug.print("Received {} bytes from tracker\n", .{body.len});
 
-    // Copy the body to a new buffer
     const body_copy = try allocator.dupe(u8, body);
 
     return try parseTrackerResponse(allocator, body_copy);
 }
 
 fn parseTrackerResponse(allocator: Allocator, response: []const u8) !Response {
-    var stream = std.io.fixedBufferStream(response);
-    const decoded = try bencode.decode(allocator, stream.reader());
-    defer decoded.deinit();
+    var decoded = try bencode.parse(allocator, response);
+    defer decoded.deinit(allocator);
 
-    if (decoded.data != .dictionary) return error.InvalidTrackerResponse;
-    const dict = decoded.data.dictionary;
+    if (decoded != .dict) return error.InvalidTrackerResponse;
+    const dict = decoded.dict;
 
     if (dict.get("failure reason")) |failure| {
-        if (failure.data == .string) {
-            std.debug.print("Tracker failure: {s}\n", .{failure.data.string});
+        if (failure == .string) {
+            std.debug.print("Tracker failure: {s}\n", .{failure.string});
         }
         return error.TrackerFailure;
     }
 
     const interval_value = dict.get("interval") orelse return error.MissingInterval;
-    const interval = if (interval_value.data == .integer)
-        @as(u32, @intCast(interval_value.data.integer))
+    const interval = if (interval_value == .integer)
+        @as(u32, @intCast(interval_value.integer))
     else
         return error.InvalidInterval;
 
     const peers_value = dict.get("peers") orelse return error.MissingPeers;
-    const peers = if (peers_value.data == .string)
-        try allocator.dupe(u8, peers_value.data.string)
+    const peers = if (peers_value == .string)
+        try allocator.dupe(u8, peers_value.string)
     else
         return error.InvalidPeers;
     errdefer allocator.free(peers);
@@ -192,13 +161,12 @@ fn parseTrackerResponse(allocator: Allocator, response: []const u8) !Response {
 }
 
 fn buildTrackerUrl(allocator: Allocator, torrent_file: *const torrent.TorrentFile, peer_id: *const [20]u8, port: u16) ![]const u8 {
-    return buildTrackerUrlWithAnnounce(allocator, torrent_file.announce, torrent_file, peer_id, port);
+    return buildTrackerUrlWithAnnounce(allocator, torrent_file.announce_url, torrent_file, peer_id, port);
 }
 
 fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, torrent_file: *const torrent.TorrentFile, peer_id: *const [20]u8, port: u16) ![]const u8 {
     const info_hash = try torrent_file.calculateInfoHash();
 
-    // URL encode the info_hash and peer_id
     var encoded_info_hash = try allocator.alloc(u8, info_hash.len * 3);
     defer allocator.free(encoded_info_hash);
     var encoded_peer_id = try allocator.alloc(u8, peer_id.len * 3);
@@ -208,16 +176,15 @@ fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, torre
     var peer_id_len: usize = 0;
 
     for (info_hash) |byte| {
-        const hex = try std.fmt.bufPrint(encoded_info_hash[info_hash_len..], "%%{X:0>2}", .{byte});
+        const hex = try std.fmt.bufPrint(encoded_info_hash[info_hash_len..], "%{X:0>2}", .{byte});
         info_hash_len += hex.len;
     }
 
     for (peer_id.*) |byte| {
-        const hex = try std.fmt.bufPrint(encoded_peer_id[peer_id_len..], "%%{X:0>2}", .{byte});
+        const hex = try std.fmt.bufPrint(encoded_peer_id[peer_id_len..], "%{X:0>2}", .{byte});
         peer_id_len += hex.len;
     }
 
-    // Calculate total file size for the "left" parameter
     var total_size: u64 = 0;
     if (torrent_file.info.files) |files| {
         for (files) |file| {
@@ -227,11 +194,9 @@ fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, torre
         total_size = length;
     }
 
-    // Check if the announce URL already has query parameters
     const has_query = std.mem.indexOf(u8, announce, "?") != null;
     const separator = if (has_query) "&" else "?";
 
-    // Build the URL with all required parameters
     return std.fmt.allocPrint(allocator, "{s}{s}info_hash={s}&peer_id={s}&port={d}&uploaded=0&downloaded=0&left={d}&compact=1&event=started", .{
         announce,
         separator,
