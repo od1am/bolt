@@ -57,7 +57,16 @@ pub fn main() !void {
     defer peer_manager.deinit();
 
     std.debug.print("Requesting peers from tracker...\n", .{});
-    const tracker_response = try tracker.requestPeers(allocator, &torrent_file, &conf.peer_id, conf.listen_port);
+    const params = tracker.RequestParams{
+        .info_hash = info_hash,
+        .peer_id = conf.peer_id,
+        .port = conf.listen_port,
+        .uploaded = 0,
+        .downloaded = 0,
+        .left = 0, // TODO: Calculate actual remaining bytes
+        .compact = true,
+    };
+    const tracker_response = try tracker.requestPeers(allocator, &torrent_file, params);
     defer allocator.free(tracker_response.peers);
 
     std.debug.print("Received {} bytes of peer data from tracker\n", .{tracker_response.peers.len});
@@ -90,4 +99,8 @@ fn parsePieceHashes(allocator: Allocator, pieces: []const u8) ![]const [20]u8 {
         @memcpy(&hashes[i], pieces[start .. start + 20]);
     }
     return hashes;
+}
+
+fn parseTorrentFile(allocator: Allocator, data: []const u8) !torrent.TorrentFile {
+    return try torrent.parseTorrentFile(allocator, data);
 }

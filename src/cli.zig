@@ -2,7 +2,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 
-// Parse command-line arguments into a Config struct
 pub fn parseArgs(allocator: Allocator) !Config {
     var config = Config{
         .torrent_path = try allocator.dupe(u8, ""),
@@ -15,7 +14,6 @@ pub fn parseArgs(allocator: Allocator) !Config {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
 
-    // Skip executable name
     _ = args.next();
 
     while (args.next()) |arg| {

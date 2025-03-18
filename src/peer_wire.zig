@@ -3,7 +3,6 @@ const net = std.net;
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
 
-// Peer Wire Protocol message types
 pub const MessageType = enum(u8) {
     choke = 0,
     unchoke = 1,
@@ -14,20 +13,19 @@ pub const MessageType = enum(u8) {
     request = 6,
     piece = 7,
     cancel = 8,
-    keep_alive = 255, // Special case for keep-alive messages
+    keep_alive = 255,
 };
 
-// Peer Wire Protocol message structure
 pub const PeerMessage = union(enum) {
     choke: void,
     unchoke: void,
     interested: void,
     not_interested: void,
-    have: u32, // Piece index
-    bitfield: []const u8, // Bitfield of available pieces
-    request: struct { index: u32, begin: u32, length: u32 }, // Request a block
-    piece: struct { index: u32, begin: u32, block: []const u8 }, // Data block
-    cancel: struct { index: u32, begin: u32, length: u32 }, // Cancel a request
+    have: u32,
+    bitfield: []const u8,
+    request: struct { index: u32, begin: u32, length: u32 },
+    piece: struct { index: u32, begin: u32, block: []const u8 },
+    cancel: struct { index: u32, begin: u32, length: u32 },
     keep_alive: void,
 
     pub fn deinit(self: *PeerMessage, allocator: Allocator) void {
@@ -39,7 +37,6 @@ pub const PeerMessage = union(enum) {
     }
 };
 
-// Peer connection state
 pub const PeerConnection = struct {
     socket: net.Stream,
     peer_id: [20]u8,
@@ -50,14 +47,28 @@ pub const PeerConnection = struct {
         self.socket.close();
     }
 
-    // Perform the handshake with the peer
+    pub fn setReadTimeout(self: *PeerConnection, milliseconds: u32) !void {
+        if (@hasDecl(std.os, "SO_RCVTIMEO")) {
+            const timeout = std.posix.timeval{
+                .tv_sec = @intCast(milliseconds / 1000),
+                .tv_usec = @intCast((milliseconds % 1000) * 1000),
+            };
+            try std.posix.setsockopt(
+                self.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RCVTIMEO,
+                std.mem.asBytes(&timeout),
+            );
+        }
+    }
+
     pub fn handshake(self: *PeerConnection) !void {
         var handshake_buffer: [68]u8 = undefined;
-        handshake_buffer[0] = 19; // Protocol identifier length
-        @memcpy(handshake_buffer[1..20], "BitTorrent protocol"); // Protocol identifier
-        @memset(handshake_buffer[20..28], 0); // Reserved bytes
-        @memcpy(handshake_buffer[28..48], &self.info_hash); // Info hash
-        @memcpy(handshake_buffer[48..68], &self.peer_id); // Peer ID
+        handshake_buffer[0] = 19;
+        @memcpy(handshake_buffer[1..20], "BitTorrent protocol");
+        @memset(handshake_buffer[20..28], 0);
+        @memcpy(handshake_buffer[28..48], &self.info_hash);
+        @memcpy(handshake_buffer[48..68], &self.peer_id);
 
         try self.socket.writeAll(&handshake_buffer);
 
@@ -65,12 +76,10 @@ pub const PeerConnection = struct {
         const bytes_read = try self.socket.readAll(&response);
         if (bytes_read != 68) return error.HandshakeFailed;
 
-        // Verify the response
         if (!std.mem.eql(u8, response[1..20], "BitTorrent protocol")) return error.HandshakeFailed;
         if (!std.mem.eql(u8, response[28..48], &self.info_hash)) return error.HandshakeFailed;
     }
 
-    // Read a message from the peer
     pub fn readMessage(self: *PeerConnection) !PeerMessage {
         var length_buf: [4]u8 = undefined;
         const bytes_read = try self.socket.read(&length_buf);
@@ -127,7 +136,6 @@ pub const PeerConnection = struct {
         }
     }
 
-    // Send a message to the peer
     pub fn sendMessage(self: *PeerConnection, message: PeerMessage) !void {
         switch (message) {
             .choke => try self.sendMessageType(.choke),
@@ -180,15 +188,13 @@ pub const PeerConnection = struct {
         }
     }
 
-    // Helper function to send a message type without payload
     fn sendMessageType(self: *PeerConnection, message_type: MessageType) !void {
         var buf: [5]u8 = undefined;
-        std.mem.writeInt(u32, buf[0..4], 1, .big); // Length prefix
+        std.mem.writeInt(u32, buf[0..4], 1, .big);
         buf[4] = @intFromEnum(message_type);
         try self.socket.writeAll(&buf);
     }
 
-    // Helper function to send a message buffer
     fn sendMessageBuffer(self: *PeerConnection, buffer: []const u8) !void {
         var length_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &length_buf, @intCast(buffer.len), .big);

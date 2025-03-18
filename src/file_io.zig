@@ -2,12 +2,11 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const File = @import("torrent.zig").File;
 
-// FileIO handles writing downloaded pieces to disk
 pub const FileIO = struct {
     allocator: Allocator,
-    files: []const File, // Changed to const slice
-    file_handles: []std.fs.File, // File handles for each file
-    piece_length: usize, // Size of each piece in bytes
+    files: []const File,
+    file_handles: []std.fs.File,
+    piece_length: usize,
 
     pub fn init(allocator: Allocator, files: []const File, piece_length: usize, output_dir: []const u8) !FileIO {
         var file_handles = try allocator.alloc(std.fs.File, files.len);
@@ -17,11 +16,9 @@ pub const FileIO = struct {
             const file_path = try std.fs.path.join(allocator, &[_][]const u8{ output_dir, file.path });
             defer allocator.free(file_path);
 
-            // Create parent directories if they don't exist
             const dir_path = std.fs.path.dirname(file_path) orelse "";
             try std.fs.cwd().makePath(dir_path);
 
-            // Create or truncate the file
             file_handles[i] = try std.fs.cwd().createFile(file_path, .{ .truncate = true });
         }
 
@@ -39,8 +36,7 @@ pub const FileIO = struct {
         }
         self.allocator.free(self.file_handles);
     }
-
-    // Write a block of data to the appropriate file(s)
+    
     pub fn writeBlock(self: *FileIO, piece_index: usize, begin: usize, block: []const u8) !void {
         var remaining_data = block;
         var current_offset = piece_index * self.piece_length + begin;

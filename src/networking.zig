@@ -49,8 +49,24 @@ pub const PeerManager = struct {
         
         std.debug.print("Attempting to connect to peer {s}\n", .{ip});
 
-        const socket = try net.tcpConnectToAddress(address);
+        // Set a connection timeout
+        const socket = net.tcpConnectToAddress(address) catch |err| {
+            std.debug.print("Failed to connect to peer {s}: {}\n", .{ip, err});
+            return err;
+        };
         errdefer socket.close();
+
+        // Set socket options for better performance
+        if (@hasDecl(std.os, "TCP_NODELAY")) {
+            std.posix.setsockopt(
+                socket.handle,
+                std.posix.IPPROTO.TCP,
+                std.posix.TCP.NODELAY,
+                &std.mem.toBytes(@as(c_int, 1)),
+            ) catch |err| {
+                std.debug.print("Failed to set TCP_NODELAY: {}\n", .{err});
+            };
+        }
 
         var peer = PeerConnection{
             .socket = socket,
@@ -60,7 +76,12 @@ pub const PeerManager = struct {
         };
 
         std.debug.print("Performing handshake with peer...\n", .{});
-        try peer.handshake();
+        peer.handshake() catch |err| {
+            std.debug.print("Handshake failed with peer {s}: {}\n", .{ip, err});
+            peer.deinit();
+            return err;
+        };
+        
         try self.peers.append(peer);
         std.debug.print("Successfully connected to peer {s}\n", .{ip});
     }
@@ -81,38 +102,80 @@ pub const PeerManager = struct {
     // Handle messages from a single peer (runs in a separate thread)
     fn handlePeer(self: *PeerManager, peer: *PeerConnection) !void {
         defer peer.deinit();
+        var peer_has_pieces = std.ArrayList(usize).init(self.allocator);
+        defer peer_has_pieces.deinit();
+
+        var is_choked = true;
+        var current_piece: ?usize = null;
+        var last_message_time = std.time.milliTimestamp();
+        const timeout_ms = 30 * 1000; // 30 seconds timeout
 
         while (!self.piece_manager.isDownloadComplete()) {
-            var message = try peer.readMessage();
+            // Check for timeout
+            const current_time = std.time.milliTimestamp();
+            if (current_time - last_message_time > timeout_ms) {
+                std.debug.print("Peer connection timed out after {} seconds\n", .{timeout_ms / 1000});
+                break;
+            }
+
+            // Set a read timeout on the socket
+            peer.setReadTimeout(5 * 1000) catch |err| {
+                std.debug.print("Failed to set socket timeout: {}\n", .{err});
+            };
+
+            var message = peer.readMessage() catch |err| {
+                if (err == error.WouldBlock or err == error.TimedOut) {
+                    // Send keep-alive to keep the connection active
+                    peer.sendMessage(.keep_alive) catch {};
+                    continue;
+                }
+                std.debug.print("Error reading message from peer: {}\n", .{err});
+                break;
+            };
             defer message.deinit(self.allocator);
+            
+            // Update last message time
+            last_message_time = std.time.milliTimestamp();
 
             switch (message) {
                 .unchoke => {
                     std.debug.print("Peer unchoked us - requesting pieces\n", .{});
-                    const next_piece = self.piece_manager.getNextNeededPiece();
-                    if (next_piece) |piece_index| {
-                        std.debug.print("Requesting piece {}\n", .{piece_index});
-                        try self.piece_manager.requestPiece(peer, piece_index);
-                    } else {
-                        std.debug.print("No more pieces needed\n", .{});
+                    is_choked = false;
+                    
+                    // Request a piece if we don't have one in progress
+                    if (current_piece == null) {
+                        current_piece = self.piece_manager.getNextNeededPiece();
+                        if (current_piece) |piece_index| {
+                            std.debug.print("Requesting piece {}\n", .{piece_index});
+                            self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                std.debug.print("Failed to request piece: {}\n", .{err});
+                                current_piece = null;
+                            };
+                        }
                     }
                 },
                 .piece => |piece| {
                     std.debug.print("Received piece {} (offset: {}, size: {})\n", .{ piece.index, piece.begin, piece.block.len });
 
                     try self.file_io.writeBlock(piece.index, piece.begin, piece.block);
-                    self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block.len);
+                    self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block);
 
-                    const next_piece = self.piece_manager.getNextNeededPiece();
-                    if (next_piece) |piece_index| {
-                        std.debug.print("Requesting next piece {}\n", .{piece_index});
-                        try self.piece_manager.requestPiece(peer, piece_index);
-                    } else {
-                        std.debug.print("No more pieces needed\n", .{});
+                    // If we've completed the current piece, request another one
+                    if (current_piece != null and self.piece_manager.hasPiece(current_piece.?)) {
+                        current_piece = self.piece_manager.getNextNeededPiece();
+                        if (current_piece) |piece_index| {
+                            std.debug.print("Requesting next piece {}\n", .{piece_index});
+                            self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                std.debug.print("Failed to request piece: {}\n", .{err});
+                                current_piece = null;
+                            };
+                        }
                     }
                 },
                 .choke => {
                     std.debug.print("Peer choked us\n", .{});
+                    is_choked = true;
+                    current_piece = null;
                 },
                 .interested => {
                     std.debug.print("Peer is interested\n", .{});
@@ -122,13 +185,82 @@ pub const PeerManager = struct {
                 },
                 .have => |piece_index| {
                     std.debug.print("Peer has piece {}\n", .{piece_index});
+                    try peer_has_pieces.append(piece_index);
+                    
+                    // If we're not choked and don't have a current piece, request this one
+                    if (!is_choked and current_piece == null and  
+                        !self.piece_manager.hasPiece(piece_index)) {
+                        current_piece = piece_index;
+                        self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                            std.debug.print("Failed to request piece: {}\n", .{err});
+                            current_piece = null;
+                        };
+                    }
                 },
-                .bitfield => {
-                    std.debug.print("Received peer bitfield\n", .{});
+                .bitfield => |bitfield| {
+                    std.debug.print("Received peer bitfield of length {}\n", .{bitfield.len});
+                    
+                    // Parse the bitfield to see which pieces the peer has
+                    for (0..self.piece_manager.total_pieces) |i| {
+                        const byte_index = i / 8;
+                        if (byte_index >= bitfield.len) break;
+                        
+                        const bit_index = 7 - @as(u3, @intCast(i % 8)); // MSB first in BitTorrent protocol
+                        const has_piece = (bitfield[byte_index] & (@as(u8, 1) << bit_index)) != 0;
+                        
+                        if (has_piece) {
+                            try peer_has_pieces.append(i);
+                        }
+                    }
+                    
+                    std.debug.print("Peer has {} pieces\n", .{peer_has_pieces.items.len});
+                    
+                    // If we're not choked, request a piece
+                    if (!is_choked and current_piece == null) {
+                        // First try to find a piece this peer has that we need
+                        for (peer_has_pieces.items) |piece_index| {
+                            if (!self.piece_manager.hasPiece(piece_index)) {
+                                current_piece = piece_index;
+                                self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                    std.debug.print("Failed to request piece: {}\n", .{err});
+                                    current_piece = null;
+                                    continue;
+                                };
+                                break;
+                            }
+                        }
+                        
+                        // If we couldn't find a specific piece, just get the next needed one
+                        if (current_piece == null) {
+                            current_piece = self.piece_manager.getNextNeededPiece();
+                            if (current_piece) |piece_index| {
+                                std.debug.print("Requesting piece {}\n", .{piece_index});
+                                self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                    std.debug.print("Failed to request piece: {}\n", .{err});
+                                    current_piece = null;
+                                };
+                            }
+                        }
+                    }
+                },
+                .keep_alive => {
+                    std.debug.print("Received keep-alive message\n", .{});
                 },
                 else => {
                     std.debug.print("Received other message type\n", .{});
                 },
+            }
+            
+            // If we're not choked and don't have a current piece, try to get one
+            if (!is_choked and current_piece == null) {
+                current_piece = self.piece_manager.getNextNeededPiece();
+                if (current_piece) |piece_index| {
+                    std.debug.print("Requesting piece {}\n", .{piece_index});
+                    self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                        std.debug.print("Failed to request piece: {}\n", .{err});
+                        current_piece = null;
+                    };
+                }
             }
         }
         std.debug.print("Download complete for this peer\n", .{});
@@ -141,12 +273,11 @@ pub fn parseCompactPeers(allocator: Allocator, data: []const u8) ![]net.Address 
     errdefer peers.deinit();
 
     var i: usize = 0;
-    while (i + 6 <= data.len) {
-        const ip = data[i..][0..4];
+    while (i + 6 <= data.len) : (i += 6) {
+        const ip_bytes = data[i..][0..4].*;
         const port = std.mem.readInt(u16, data[i + 4 ..][0..2], .big);
-        const address = try net.Address.parseIp4(ip, port);
+        const address = net.Address.initIp4(ip_bytes, port);
         try peers.append(address);
-        i += 6;
     }
 
     return peers.toOwnedSlice();

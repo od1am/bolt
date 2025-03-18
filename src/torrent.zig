@@ -49,6 +49,17 @@ pub const File = struct {
     }
 };
 
+pub const Torrent_State = enum {
+    queued,
+    checking_for_files,
+    downloading_metadata,
+    finished,
+    seeding,
+    missing_files,
+    downloading,
+    stopped,
+};
+
 pub fn parseTorrentFile(allocator: Allocator, data: []const u8) !TorrentFile {
     const bencode = @import("bencode.zig");
     var bencode_value = try bencode.parse(allocator, data);
