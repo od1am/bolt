@@ -96,7 +96,7 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
     } else {
         full_path = path;
     }
-    
+
     defer if (path_to_free != null) allocator.free(path_to_free.?);
 
     const request = try std.fmt.allocPrint(allocator, "GET {s} HTTP/1.1\r\n" ++
@@ -167,10 +167,14 @@ fn sendHttpRequest(allocator: Allocator, url: []const u8) !Response {
 }
 
 fn parseTrackerResponse(allocator: Allocator, response: []const u8) !Response {
+    std.debug.print("Parsing tracker response...\n", .{});
     var decoded = try bencode.parse(allocator, response);
     defer decoded.deinit(allocator);
 
-    if (decoded != .dict) return error.InvalidTrackerResponse;
+    if (decoded != .dict) {
+        std.debug.print("Invalid tracker response: expected dictionary\n", .{});
+        return error.InvalidTrackerResponse;
+    }
     const dict = decoded.dict;
 
     if (dict.get("failure reason")) |failure| {
@@ -180,42 +184,73 @@ fn parseTrackerResponse(allocator: Allocator, response: []const u8) !Response {
         return error.TrackerFailure;
     }
 
-    const interval_value = dict.get("interval") orelse return error.MissingInterval;
+    const interval_value = dict.get("interval") orelse {
+        std.debug.print("Missing interval in tracker response\n", .{});
+        return error.MissingInterval;
+    };
     const interval = if (interval_value == .integer)
         @as(u32, @intCast(interval_value.integer))
-    else
+    else {
+        std.debug.print("Invalid interval value in tracker response\n", .{});
         return error.InvalidInterval;
+    };
 
-    const min_interval = if (dict.get("min interval")) |mi| 
+    std.debug.print("Tracker interval: {} seconds\n", .{interval});
+
+    const min_interval = if (dict.get("min interval")) |mi|
         if (mi == .integer) @as(u32, @intCast(mi.integer)) else null
-    else null;
+    else
+        null;
+
+    if (min_interval) |mi| {
+        std.debug.print("Tracker min interval: {} seconds\n", .{mi});
+    }
 
     const tracker_id = if (dict.get("tracker id")) |ti|
         if (ti == .string) try allocator.dupe(u8, ti.string) else null
-    else null;
+    else
+        null;
 
     const complete = if (dict.get("complete")) |c|
         if (c == .integer) @as(u32, @intCast(c.integer)) else null
-    else null;
+    else
+        null;
 
     const incomplete = if (dict.get("incomplete")) |i|
         if (i == .integer) @as(u32, @intCast(i.integer)) else null
-    else null;
+    else
+        null;
+
+    if (complete) |c| std.debug.print("Complete peers: {}\n", .{c});
+    if (incomplete) |i| std.debug.print("Incomplete peers: {}\n", .{i});
 
     const warning_message = if (dict.get("warning message")) |wm|
         if (wm == .string) try allocator.dupe(u8, wm.string) else null
-    else null;
+    else
+        null;
 
-    const peers_value = dict.get("peers") orelse return error.MissingPeers;
+    if (warning_message) |wm| std.debug.print("Tracker warning: {s}\n", .{wm});
+
+    const peers_value = dict.get("peers") orelse {
+        std.debug.print("Missing peers in tracker response\n", .{});
+        return error.MissingPeers;
+    };
     const peers = if (peers_value == .string)
         try allocator.dupe(u8, peers_value.string)
-    else
+    else {
+        std.debug.print("Invalid peers value in tracker response\n", .{});
         return error.InvalidPeers;
+    };
     errdefer allocator.free(peers);
+
+    std.debug.print("Received {} bytes of peer data\n", .{peers.len});
 
     const peers6 = if (dict.get("peers6")) |p6|
         if (p6 == .string) try allocator.dupe(u8, p6.string) else null
-    else null;
+    else
+        null;
+
+    if (peers6) |p6| std.debug.print("Received {} bytes of IPv6 peer data\n", .{p6.len});
 
     return Response{
         .interval = interval,
@@ -275,11 +310,11 @@ fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, param
     try query_parts.append(try std.fmt.allocPrint(allocator, "downloaded={d}", .{params.downloaded}));
     try query_parts.append(try std.fmt.allocPrint(allocator, "left={d}", .{params.left}));
     try query_parts.append(try std.fmt.allocPrint(allocator, "compact={d}", .{@as(u8, if (params.compact) 1 else 0)}));
-    
+
     if (params.no_peer_id) {
         try query_parts.append("no_peer_id=1");
     }
-    
+
     if (params.event != .none) {
         const event_str = switch (params.event) {
             .started => "started",
@@ -289,19 +324,19 @@ fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, param
         };
         try query_parts.append(try std.fmt.allocPrint(allocator, "event={s}", .{event_str}));
     }
-    
+
     if (params.ip) |ip| {
         try query_parts.append(try std.fmt.allocPrint(allocator, "ip={s}", .{ip}));
     }
-    
+
     if (params.numwant) |numwant| {
         try query_parts.append(try std.fmt.allocPrint(allocator, "numwant={d}", .{numwant}));
     }
-    
+
     if (params.key) |key| {
         try query_parts.append(try std.fmt.allocPrint(allocator, "key={s}", .{key}));
     }
-    
+
     if (params.trackerid) |trackerid| {
         try query_parts.append(try std.fmt.allocPrint(allocator, "trackerid={s}", .{trackerid}));
     }
@@ -314,9 +349,9 @@ fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, param
 
 fn isUrlSafe(byte: u8) bool {
     return (byte >= '0' and byte <= '9') or
-           (byte >= 'a' and byte <= 'z') or
-           (byte >= 'A' and byte <= 'Z') or
-           byte == '.' or byte == '-' or byte == '_' or byte == '~';
+        (byte >= 'a' and byte <= 'z') or
+        (byte >= 'A' and byte <= 'Z') or
+        byte == '.' or byte == '-' or byte == '_' or byte == '~';
 }
 
 pub fn parseCompactPeers(allocator: Allocator, data: []const u8) ![]net.Address {
@@ -328,7 +363,7 @@ pub fn parseCompactPeers(allocator: Allocator, data: []const u8) ![]net.Address 
         const ip_bytes = data[i..][0..4];
         const port_bytes = data[i + 4 ..][0..2];
         const port = std.mem.readInt(u16, port_bytes, .big);
-        
+
         const ip4 = std.net.Ip4Address.init(ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3], port);
         const addr = net.Address{ .in = ip4 };
         try peers.append(addr);

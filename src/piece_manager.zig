@@ -91,10 +91,10 @@ pub const PieceManager = struct {
         hasher.update(piece_data);
         var hash: [20]u8 = undefined;
         hasher.final(&hash);
-        
+
         const expected_hash = self.piece_hashes[piece_index];
         const matches = std.mem.eql(u8, &hash, &expected_hash);
-        
+
         if (!matches) {
             std.debug.print("Hash verification failed for piece {}:\n", .{piece_index});
             std.debug.print("  Expected: ", .{});
@@ -107,7 +107,7 @@ pub const PieceManager = struct {
             }
             std.debug.print("\n", .{});
         }
-        
+
         return matches;
     }
 
@@ -144,7 +144,7 @@ pub const PieceManager = struct {
             while (i < num_blocks) : (i += 1) {
                 const length = @min(self.block_size, piece_size - offset);
                 piece.blocks[i] = Block{
-                    .data = undefined, // Will be allocated when received
+                    .data = try self.allocator.alloc(u8, length),
                     .begin = offset,
                     .length = length,
                     .received = false,
@@ -173,7 +173,7 @@ pub const PieceManager = struct {
 
     pub fn markBlockReceived(self: *PieceManager, piece_index: u32, begin: u32, block_data: []const u8) void {
         const idx = @as(usize, piece_index);
-        
+
         if (self.hasPiece(idx)) {
             std.debug.print("Already have piece {}, ignoring block\n", .{idx});
             return;
@@ -185,7 +185,7 @@ pub const PieceManager = struct {
         }
 
         const piece = self.in_progress_pieces.get(idx).?;
-        
+
         // Find the block
         for (piece.blocks) |*block| {
             if (block.begin == begin and block.length == block_data.len) {
@@ -226,7 +226,7 @@ pub const PieceManager = struct {
             total_size += block.length;
         }
 
-        // Combine all blocks into a single buffer
+        // Combine all blocks into a single buffer for verification
         var piece_data = try self.allocator.alloc(u8, total_size);
         defer self.allocator.free(piece_data);
 
@@ -239,27 +239,32 @@ pub const PieceManager = struct {
         // Verify the piece hash
         if (self.verifyPiece(piece.index, piece_data)) {
             std.debug.print("Piece {} verified successfully\n", .{piece.index});
-            
-            // Write the piece to disk
-            try self.writePiece(piece.index, piece_data);
-            
+
+            // Write each block to disk
+            offset = 0;
+            for (piece.blocks) |block| {
+                try self.file_handle.seekTo(piece.index * self.piece_length + block.begin);
+                try self.file_handle.writeAll(block.data[0..block.length]);
+                offset += block.length;
+            }
+
             // Mark the piece as complete
             self.markPieceComplete(piece.index);
-            
+
             // Clean up the piece data
             for (piece.blocks) |*block| {
                 if (block.received) {
                     self.allocator.free(block.data);
                 }
             }
-            
+
             // Remove from in-progress map
             _ = self.in_progress_pieces.remove(piece.index);
             self.allocator.free(piece.blocks);
             self.allocator.destroy(piece);
         } else {
             std.debug.print("Piece {} verification failed, will re-download\n", .{piece.index});
-            
+
             // Reset the piece to try again
             for (piece.blocks) |*block| {
                 if (block.received) {

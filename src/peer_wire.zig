@@ -63,6 +63,7 @@ pub const PeerConnection = struct {
     }
 
     pub fn handshake(self: *PeerConnection) !void {
+        std.debug.print("Starting handshake with peer...\n", .{});
         var handshake_buffer: [68]u8 = undefined;
         handshake_buffer[0] = 19;
         @memcpy(handshake_buffer[1..20], "BitTorrent protocol");
@@ -70,14 +71,29 @@ pub const PeerConnection = struct {
         @memcpy(handshake_buffer[28..48], &self.info_hash);
         @memcpy(handshake_buffer[48..68], &self.peer_id);
 
+        std.debug.print("Sending handshake message...\n", .{});
         try self.socket.writeAll(&handshake_buffer);
+        std.debug.print("Handshake message sent successfully\n", .{});
 
         var response: [68]u8 = undefined;
+        std.debug.print("Waiting for peer response...\n", .{});
         const bytes_read = try self.socket.readAll(&response);
-        if (bytes_read != 68) return error.HandshakeFailed;
+        std.debug.print("Received {} bytes from peer\n", .{bytes_read});
 
-        if (!std.mem.eql(u8, response[1..20], "BitTorrent protocol")) return error.HandshakeFailed;
-        if (!std.mem.eql(u8, response[28..48], &self.info_hash)) return error.HandshakeFailed;
+        if (bytes_read != 68) {
+            std.debug.print("Invalid handshake response length: expected 68, got {}\n", .{bytes_read});
+            return error.HandshakeFailed;
+        }
+
+        if (!std.mem.eql(u8, response[1..20], "BitTorrent protocol")) {
+            std.debug.print("Invalid protocol identifier in handshake\n", .{});
+            return error.HandshakeFailed;
+        }
+        if (!std.mem.eql(u8, response[28..48], &self.info_hash)) {
+            std.debug.print("Info hash mismatch in handshake\n", .{});
+            return error.HandshakeFailed;
+        }
+        std.debug.print("Handshake completed successfully\n", .{});
     }
 
     pub fn readMessage(self: *PeerConnection) !PeerMessage {

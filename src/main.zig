@@ -57,13 +57,20 @@ pub fn main() !void {
     defer peer_manager.deinit();
 
     std.debug.print("Requesting peers from tracker...\n", .{});
+    const total_size = if (torrent_file.info.length) |len| len else blk: {
+        var sum: usize = 0;
+        for (files) |file| {
+            sum += file.length;
+        }
+        break :blk sum;
+    };
     const params = tracker.RequestParams{
         .info_hash = info_hash,
         .peer_id = conf.peer_id,
         .port = conf.listen_port,
         .uploaded = 0,
         .downloaded = 0,
-        .left = 0, // TODO: Calculate actual remaining bytes
+        .left = total_size,
         .compact = true,
     };
     const tracker_response = try tracker.requestPeers(allocator, &torrent_file, params);

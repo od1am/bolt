@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Zig
+
+- Use zig version 0.13
+- Always make sure to use existing functions and add no external dependencies
