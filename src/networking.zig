@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const ArrayList = std.ArrayList;
+const debug = std.debug;
 const os = std.os;
 const linux = os.linux;
 const net = std.net;
@@ -15,7 +17,7 @@ pub const PeerManager = struct {
     torrent_file: TorrentFile,
     piece_manager: *PieceManager,
     file_io: *FileIO,
-    peers: std.ArrayList(PeerConnection),
+    peers: ArrayList(PeerConnection),
     peer_id: [20]u8,
     info_hash: [20]u8,
 
@@ -32,7 +34,7 @@ pub const PeerManager = struct {
             .torrent_file = torrent_file,
             .piece_manager = piece_manager,
             .file_io = file_io,
-            .peers = std.ArrayList(PeerConnection).init(allocator),
+            .peers = ArrayList(PeerConnection).init(allocator),
             .peer_id = peer_id,
             .info_hash = info_hash,
         };
@@ -50,7 +52,7 @@ pub const PeerManager = struct {
         var ip_buf: [100]u8 = undefined;
         const ip = try std.fmt.bufPrint(&ip_buf, "{}", .{address});
 
-        std.debug.print("Attempting to connect to peer {s}\n", .{ip});
+        debug.print("Attempting to connect to peer {s}\n", .{ip});
 
         // Create a socket
         const socket = try std.net.tcpConnectToAddress(address);
@@ -63,7 +65,7 @@ pub const PeerManager = struct {
             defer os.close(epfd);
 
             // Set socket to non-blocking mode
-            try linux.fcntl(socket.handle, linux.F_SETFL, try linux.fcntl(socket.handle, linux.F_GETFL, 0) | linux.O.NONBLOCK);
+            try linux.fcntl(socket.handle, linux.F.SETFL, try linux.fcntl(socket.handle, linux.F.GETFL, 0) | linux.O.NONBLOCK);
 
             // Add socket to epoll
             var event = os.linux.epoll_event{
@@ -74,33 +76,33 @@ pub const PeerManager = struct {
 
             // Wait for connection with timeout
             var events: [1]os.linux.epoll_event = undefined;
-            const timeout_ms = 5000; // 5 seconds
+            const timeout_ms = 3000; // 3 seconds
             const num_events = try os.linux.epoll_wait(epfd, &events, timeout_ms);
 
             if (num_events == 0) {
-                std.debug.print("Connection timeout for peer {s}\n", .{ip});
+                debug.print("Connection timeout for peer {s}\n", .{ip});
                 return error.ConnectionTimeout;
             }
 
             if ((events[0].events & os.linux.EPOLL.ERR) != 0) {
-                std.debug.print("Connection error for peer {s}\n", .{ip});
+                debug.print("Connection error for peer {s}\n", .{ip});
                 return error.ConnectionFailed;
             }
 
             // Set socket back to blocking mode
-            try linux.fcntl(socket.handle, linux.F_SETFL, try linux.fcntl(socket.handle, linux.F_GETFL, 0) & ~linux.O.NONBLOCK);
+            try linux.fcntl(socket.handle, linux.F.SETFL, try linux.fcntl(socket.handle, linux.F.GETFL, 0) & ~linux.O.NONBLOCK);
         } else {
             // Fallback for non-Linux platforms
             // Set a reasonable timeout on the socket directly
-            try socket.setOption(.send_timeout, 5000); // 5 second timeout
-            try socket.setOption(.recv_timeout, 5000); // 5 second timeout
+            try socket.setOption(.send_timeout, 3000); // 3 second timeout
+            try socket.setOption(.recv_timeout, 3000); // 3 second timeout
         }
 
         // Set socket options for better performance
         if (@hasDecl(std.os, "TCP_NODELAY")) {
-            std.debug.print("Setting TCP_NODELAY option...\n", .{});
+            debug.print("Setting TCP_NODELAY option...\n", .{});
             socket.setOption(.tcp_nodelay, true) catch |err| {
-                std.debug.print("Failed to set TCP_NODELAY: {}\n", .{err});
+                debug.print("Failed to set TCP_NODELAY: {}\n", .{err});
             };
         }
 
@@ -111,23 +113,23 @@ pub const PeerManager = struct {
             .allocator = self.allocator,
         };
 
-        std.debug.print("Performing handshake with peer...\n", .{});
+        debug.print("Performing handshake with peer...\n", .{});
         peer.handshake() catch |err| {
-            std.debug.print("Handshake failed with peer {s}: {}\n", .{ ip, err });
+            debug.print("Handshake failed with peer {s}: {}\n", .{ ip, err });
             peer.deinit();
             return err;
         };
 
         try self.peers.append(peer);
-        std.debug.print("Successfully connected to peer {s}\n", .{ip});
+        debug.print("Successfully connected to peer {s}\n", .{ip});
     }
 
     // Start downloading pieces from all connected peers
     pub fn startDownload(self: *PeerManager) !void {
-        std.debug.print("Starting download with {} connected peers\n", .{self.peers.items.len});
+        debug.print("Starting download with {} connected peers\n", .{self.peers.items.len});
 
         for (self.peers.items) |*peer| {
-            std.debug.print("Sending interested message to peer\n", .{});
+            debug.print("Sending interested message to peer\n", .{});
             try peer.sendMessage(.interested);
 
             const thread = try std.Thread.spawn(.{}, handlePeer, .{ self, peer });
@@ -150,13 +152,13 @@ pub const PeerManager = struct {
             // Check for timeout
             const current_time = std.time.milliTimestamp();
             if (current_time - last_message_time > timeout_ms) {
-                std.debug.print("Peer connection timed out after {} seconds\n", .{timeout_ms / 1000});
+                debug.print("Peer connection timed out after {} seconds\n", .{timeout_ms / 1000});
                 break;
             }
 
             // Set a read timeout on the socket
             peer.setReadTimeout(5 * 1000) catch |err| {
-                std.debug.print("Failed to set socket timeout: {}\n", .{err});
+                debug.print("Failed to set socket timeout: {}\n", .{err});
             };
 
             var message = peer.readMessage() catch |err| {
@@ -165,7 +167,7 @@ pub const PeerManager = struct {
                     peer.sendMessage(.keep_alive) catch {};
                     continue;
                 }
-                std.debug.print("Error reading message from peer: {}\n", .{err});
+                debug.print("Error reading message from peer: {}\n", .{err});
                 break;
             };
             defer message.deinit(self.allocator);
@@ -175,23 +177,23 @@ pub const PeerManager = struct {
 
             switch (message) {
                 .unchoke => {
-                    std.debug.print("Peer unchoked us - requesting pieces\n", .{});
+                    debug.print("Peer unchoked us - requesting pieces\n", .{});
                     is_choked = false;
 
                     // Request a piece if we don't have one in progress
                     if (current_piece == null) {
                         current_piece = self.piece_manager.getNextNeededPiece();
                         if (current_piece) |piece_index| {
-                            std.debug.print("Requesting piece {}\n", .{piece_index});
+                            debug.print("Requesting piece {}\n", .{piece_index});
                             self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                                std.debug.print("Failed to request piece: {}\n", .{err});
+                                debug.print("Failed to request piece: {}\n", .{err});
                                 current_piece = null;
                             };
                         }
                     }
                 },
                 .piece => |piece| {
-                    std.debug.print("Received piece {} (offset: {}, size: {})\n", .{ piece.index, piece.begin, piece.block.len });
+                    debug.print("Received piece {} (offset: {}, size: {})\n", .{ piece.index, piece.begin, piece.block.len });
 
                     try self.file_io.writeBlock(piece.index, piece.begin, piece.block);
                     self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block);
@@ -200,27 +202,27 @@ pub const PeerManager = struct {
                     if (current_piece != null and self.piece_manager.hasPiece(current_piece.?)) {
                         current_piece = self.piece_manager.getNextNeededPiece();
                         if (current_piece) |piece_index| {
-                            std.debug.print("Requesting next piece {}\n", .{piece_index});
+                            debug.print("Requesting next piece {}\n", .{piece_index});
                             self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                                std.debug.print("Failed to request piece: {}\n", .{err});
+                                debug.print("Failed to request piece: {}\n", .{err});
                                 current_piece = null;
                             };
                         }
                     }
                 },
                 .choke => {
-                    std.debug.print("Peer choked us\n", .{});
+                    debug.print("Peer choked us\n", .{});
                     is_choked = true;
                     current_piece = null;
                 },
                 .interested => {
-                    std.debug.print("Peer is interested\n", .{});
+                    debug.print("Peer is interested\n", .{});
                 },
                 .not_interested => {
-                    std.debug.print("Peer is not interested\n", .{});
+                    debug.print("Peer is not interested\n", .{});
                 },
                 .have => |piece_index| {
-                    std.debug.print("Peer has piece {}\n", .{piece_index});
+                    debug.print("Peer has piece {}\n", .{piece_index});
                     try peer_has_pieces.append(piece_index);
 
                     // If we're not choked and don't have a current piece, request this one
@@ -229,13 +231,13 @@ pub const PeerManager = struct {
                     {
                         current_piece = piece_index;
                         self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                            std.debug.print("Failed to request piece: {}\n", .{err});
+                            debug.print("Failed to request piece: {}\n", .{err});
                             current_piece = null;
                         };
                     }
                 },
                 .bitfield => |bitfield| {
-                    std.debug.print("Received peer bitfield of length {}\n", .{bitfield.len});
+                    debug.print("Received peer bitfield of length {}\n", .{bitfield.len});
 
                     // Parse the bitfield to see which pieces the peer has
                     for (0..self.piece_manager.total_pieces) |i| {
@@ -250,7 +252,7 @@ pub const PeerManager = struct {
                         }
                     }
 
-                    std.debug.print("Peer has {} pieces\n", .{peer_has_pieces.items.len});
+                    debug.print("Peer has {} pieces\n", .{peer_has_pieces.items.len});
 
                     // If we're not choked, request a piece
                     if (!is_choked and current_piece == null) {
@@ -259,7 +261,7 @@ pub const PeerManager = struct {
                             if (!self.piece_manager.hasPiece(piece_index)) {
                                 current_piece = piece_index;
                                 self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                                    std.debug.print("Failed to request piece: {}\n", .{err});
+                                    debug.print("Failed to request piece: {}\n", .{err});
                                     current_piece = null;
                                     continue;
                                 };
@@ -271,9 +273,9 @@ pub const PeerManager = struct {
                         if (current_piece == null) {
                             current_piece = self.piece_manager.getNextNeededPiece();
                             if (current_piece) |piece_index| {
-                                std.debug.print("Requesting piece {}\n", .{piece_index});
+                                debug.print("Requesting piece {}\n", .{piece_index});
                                 self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                                    std.debug.print("Failed to request piece: {}\n", .{err});
+                                    debug.print("Failed to request piece: {}\n", .{err});
                                     current_piece = null;
                                 };
                             }
@@ -281,10 +283,10 @@ pub const PeerManager = struct {
                     }
                 },
                 .keep_alive => {
-                    std.debug.print("Received keep-alive message\n", .{});
+                    debug.print("Received keep-alive message\n", .{});
                 },
                 else => {
-                    std.debug.print("Received other message type\n", .{});
+                    debug.print("Received other message type\n", .{});
                 },
             }
 
@@ -292,15 +294,15 @@ pub const PeerManager = struct {
             if (!is_choked and current_piece == null) {
                 current_piece = self.piece_manager.getNextNeededPiece();
                 if (current_piece) |piece_index| {
-                    std.debug.print("Requesting piece {}\n", .{piece_index});
+                    debug.print("Requesting piece {}\n", .{piece_index});
                     self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                        std.debug.print("Failed to request piece: {}\n", .{err});
+                        debug.print("Failed to request piece: {}\n", .{err});
                         current_piece = null;
                     };
                 }
             }
         }
-        std.debug.print("Download complete for this peer\n", .{});
+        debug.print("Download complete for this peer\n", .{});
     }
 };
 
