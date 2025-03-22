@@ -36,7 +36,7 @@ pub const FileIO = struct {
         }
         self.allocator.free(self.file_handles);
     }
-    
+
     pub fn writeBlock(self: *FileIO, piece_index: usize, begin: usize, block: []const u8) !void {
         var remaining_data = block;
         var current_offset = piece_index * self.piece_length + begin;

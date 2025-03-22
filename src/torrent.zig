@@ -4,9 +4,9 @@ const BencodeValue = @import("bencode.zig").BencodeValue;
 const StringArrayHashMap = std.StringArrayHashMap;
 
 pub const TorrentFile = struct {
-    announce_url: []const u8, 
-    info: InfoDict, 
-    info_raw: []const u8, 
+    announce_url: []const u8,
+    info: InfoDict,
+    info_raw: []const u8,
 
     pub fn deinit(self: *TorrentFile, allocator: Allocator) void {
         allocator.free(self.announce_url);
@@ -22,11 +22,11 @@ pub const TorrentFile = struct {
 };
 
 pub const InfoDict = struct {
-    name: []const u8, 
-    piece_length: usize, 
-    pieces: []const u8, 
-    length: ?usize, 
-    files: ?[]File, 
+    name: []const u8,
+    piece_length: usize,
+    pieces: []const u8,
+    length: ?usize,
+    files: ?[]File,
 
     pub fn deinit(self: *InfoDict, allocator: Allocator) void {
         allocator.free(self.name);
@@ -41,8 +41,8 @@ pub const InfoDict = struct {
 };
 
 pub const File = struct {
-    path: []const u8, 
-    length: usize, 
+    path: []const u8,
+    length: usize,
 
     pub fn deinit(self: *File, allocator: Allocator) void {
         allocator.free(self.path);

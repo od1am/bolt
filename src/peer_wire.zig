@@ -71,14 +71,10 @@ pub const PeerConnection = struct {
         @memcpy(handshake_buffer[28..48], &self.info_hash);
         @memcpy(handshake_buffer[48..68], &self.peer_id);
 
-        std.debug.print("Sending handshake message...\n", .{});
         try self.socket.writeAll(&handshake_buffer);
-        std.debug.print("Handshake message sent successfully\n", .{});
 
         var response: [68]u8 = undefined;
-        std.debug.print("Waiting for peer response...\n", .{});
         const bytes_read = try self.socket.readAll(&response);
-        std.debug.print("Received {} bytes from peer\n", .{bytes_read});
 
         if (bytes_read != 68) {
             std.debug.print("Invalid handshake response length: expected 68, got {}\n", .{bytes_read});

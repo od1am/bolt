@@ -107,7 +107,3 @@ fn parsePieceHashes(allocator: Allocator, pieces: []const u8) ![]const [20]u8 {
     }
     return hashes;
 }
-
-fn parseTorrentFile(allocator: Allocator, data: []const u8) !torrent.TorrentFile {
-    return try torrent.parseTorrentFile(allocator, data);
-}

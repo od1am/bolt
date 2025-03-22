@@ -10,6 +10,7 @@ const PeerConnection = @import("peer_wire.zig").PeerConnection;
 const PieceManager = @import("piece_manager.zig").PieceManager;
 const FileIO = @import("file_io.zig").FileIO;
 const TorrentFile = @import("torrent.zig").TorrentFile;
+const tracker_module = @import("tracker.zig");
 
 // PeerManager coordinates connections to multiple peers
 pub const PeerManager = struct {
@@ -58,53 +59,10 @@ pub const PeerManager = struct {
         const socket = try std.net.tcpConnectToAddress(address);
         errdefer socket.close();
 
-        // Use a connection timeout with epoll
-        if (builtin.os.tag == .linux) {
-            // Create epoll instance
-            const epfd = os.linux.epoll_create1(0);
-            defer os.close(epfd);
-
-            // Set socket to non-blocking mode
-            try linux.fcntl(socket.handle, linux.F.SETFL, try linux.fcntl(socket.handle, linux.F.GETFL, 0) | linux.O.NONBLOCK);
-
-            // Add socket to epoll
-            var event = os.linux.epoll_event{
-                .events = os.linux.EPOLL.OUT | os.linux.EPOLL.ERR,
-                .data = .{ .fd = socket.handle },
-            };
-            try os.linux.epoll_ctl(epfd, os.linux.EPOLL.CTL_ADD, socket.handle, &event);
-
-            // Wait for connection with timeout
-            var events: [1]os.linux.epoll_event = undefined;
-            const timeout_ms = 3000; // 3 seconds
-            const num_events = try os.linux.epoll_wait(epfd, &events, timeout_ms);
-
-            if (num_events == 0) {
-                debug.print("Connection timeout for peer {s}\n", .{ip});
-                return error.ConnectionTimeout;
-            }
-
-            if ((events[0].events & os.linux.EPOLL.ERR) != 0) {
-                debug.print("Connection error for peer {s}\n", .{ip});
-                return error.ConnectionFailed;
-            }
-
-            // Set socket back to blocking mode
-            try linux.fcntl(socket.handle, linux.F.SETFL, try linux.fcntl(socket.handle, linux.F.GETFL, 0) & ~linux.O.NONBLOCK);
-        } else {
-            // Fallback for non-Linux platforms
-            // Set a reasonable timeout on the socket directly
-            try socket.setOption(.send_timeout, 3000); // 3 second timeout
-            try socket.setOption(.recv_timeout, 3000); // 3 second timeout
-        }
-
-        // Set socket options for better performance
-        if (@hasDecl(std.os, "TCP_NODELAY")) {
-            debug.print("Setting TCP_NODELAY option...\n", .{});
-            socket.setOption(.tcp_nodelay, true) catch |err| {
-                debug.print("Failed to set TCP_NODELAY: {}\n", .{err});
-            };
-        }
+        // For non-blocking socket operations, we'll use a manual timer approach
+        // instead of relying on socket options that may vary across Zig versions
+        const start_time = std.time.milliTimestamp();
+        const timeout_ms = 3000; // 3 seconds timeout
 
         var peer = PeerConnection{
             .socket = socket,
@@ -113,8 +71,14 @@ pub const PeerManager = struct {
             .allocator = self.allocator,
         };
 
-        debug.print("Performing handshake with peer...\n", .{});
+        // Perform handshake with timeout check
         peer.handshake() catch |err| {
+            const elapsed = std.time.milliTimestamp() - start_time;
+            if (elapsed >= timeout_ms) {
+                debug.print("Handshake timed out after {} ms for peer {s}\n", .{ elapsed, ip });
+                peer.deinit();
+                return error.ConnectionTimeout;
+            }
             debug.print("Handshake failed with peer {s}: {}\n", .{ ip, err });
             peer.deinit();
             return err;
