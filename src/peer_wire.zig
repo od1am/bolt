@@ -71,6 +71,9 @@ pub const PeerConnection = struct {
         @memcpy(handshake_buffer[28..48], &self.info_hash);
         @memcpy(handshake_buffer[48..68], &self.peer_id);
 
+        // Set a reasonable timeout for handshake
+        try self.setReadTimeout(10 * 1000); // 10 second timeout
+
         try self.socket.writeAll(&handshake_buffer);
 
         var response: [68]u8 = undefined;
@@ -103,8 +106,13 @@ pub const PeerConnection = struct {
         var message_buf = try self.allocator.alloc(u8, length);
         errdefer self.allocator.free(message_buf);
 
-        const msg_bytes_read = try self.socket.read(message_buf);
-        if (msg_bytes_read != length) return error.ConnectionClosed;
+        // Ensure we read exactly 'length' bytes
+        var total_read: usize = 0;
+        while (total_read < length) {
+            const read_this_time = try self.socket.read(message_buf[total_read..]);
+            if (read_this_time == 0) return error.ConnectionClosed;
+            total_read += read_this_time;
+        }
 
         const message_type: MessageType = @enumFromInt(message_buf[0]);
         const payload = message_buf[1..];

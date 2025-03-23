@@ -5,12 +5,22 @@ const debug = std.debug;
 const os = std.os;
 const linux = os.linux;
 const net = std.net;
+const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const PeerConnection = @import("peer_wire.zig").PeerConnection;
 const PieceManager = @import("piece_manager.zig").PieceManager;
 const FileIO = @import("file_io.zig").FileIO;
 const TorrentFile = @import("torrent.zig").TorrentFile;
 const tracker_module = @import("tracker.zig");
+
+// Optional local address to bind outgoing connections to
+var local_address: ?net.Address = null;
+
+// Function to set the local address for outgoing connections
+pub fn setLocalAddress(address_str: []const u8, port: u16) !void {
+    local_address = try net.Address.parseIp(address_str, port);
+    debug.print("Local address set to {}:{}\n", .{ address_str, port });
+}
 
 // PeerManager coordinates connections to multiple peers
 pub const PeerManager = struct {
@@ -56,7 +66,22 @@ pub const PeerManager = struct {
         debug.print("Attempting to connect to peer {s}\n", .{ip});
 
         // Create a socket
-        const socket = try std.net.tcpConnectToAddress(address);
+        const socket = if (local_address) |local_addr| blk: {
+            // Create an unconnected socket
+            const sock = try posix.socket(local_addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
+            errdefer posix.close(sock);
+
+            // Bind to the local address
+            try posix.bind(sock, &local_addr.any, local_addr.getOsSockLen());
+
+            // Connect to the peer
+            try posix.connect(sock, &address.any, address.getOsSockLen());
+
+            break :blk std.net.Stream{ .handle = sock };
+        } else std.net.tcpConnectToAddress(address) catch |err| {
+            debug.print("Failed to connect to peer {s}: {}\n", .{ ip, err });
+            return err;
+        };
         errdefer socket.close();
 
         // For non-blocking socket operations, we'll use a manual timer approach
@@ -108,9 +133,18 @@ pub const PeerManager = struct {
         defer peer_has_pieces.deinit();
 
         var is_choked = true;
+        var has_sent_interested = false;
         var current_piece: ?usize = null;
         var last_message_time = std.time.milliTimestamp();
         const timeout_ms = 60 * 1000; // 60 seconds timeout
+        var consecutive_errors: u8 = 0;
+
+        // Send initial interested message (ensure we're registered as interested)
+        peer.sendMessage(.interested) catch |err| {
+            debug.print("Failed to send initial interested message: {}\n", .{err});
+        };
+        has_sent_interested = true;
+        debug.print("Initial 'interested' message sent to peer, waiting for 'unchoke'...\n", .{});
 
         while (!self.piece_manager.isDownloadComplete()) {
             // Check for timeout
@@ -128,45 +162,77 @@ pub const PeerManager = struct {
             var message = peer.readMessage() catch |err| {
                 if (err == error.WouldBlock or err == error.TimedOut) {
                     // Send keep-alive to keep the connection active
+                    debug.print("No message received in 5 seconds, sending keep-alive...\n", .{});
                     peer.sendMessage(.keep_alive) catch {};
+
+                    // If we're still choked, resend interested message periodically
+                    if (is_choked and current_time - last_message_time > 15000) {
+                        debug.print("Still choked after 15 seconds, resending interested message...\n", .{});
+                        peer.sendMessage(.interested) catch {};
+                        last_message_time = current_time; // Reset timer
+                    }
+
+                    consecutive_errors = 0;
                     continue;
                 }
-                debug.print("Error reading message from peer: {}\n", .{err});
-                break;
+
+                consecutive_errors += 1;
+                debug.print("Error reading message from peer: {} (attempt {}/3)\n", .{ err, consecutive_errors });
+
+                if (consecutive_errors >= 3) {
+                    debug.print("Too many consecutive errors, disconnecting peer\n", .{});
+                    break;
+                }
+
+                // Brief pause before retrying
+                std.time.sleep(1_000_000_000); // 1 second
+                continue;
             };
             defer message.deinit(self.allocator);
+
+            // Reset error counter since we got a successful message
+            consecutive_errors = 0;
 
             // Update last message time
             last_message_time = std.time.milliTimestamp();
 
             switch (message) {
                 .unchoke => {
-                    debug.print("Peer unchoked us - requesting pieces\n", .{});
+                    debug.print("DOWNLOAD STATUS: Peer unchoked us - now able to request pieces\n", .{});
+
+                    // Only log state transition if we were previously choked
+                    if (is_choked) {
+                        debug.print("DOWNLOAD STATE: Transitioned from CHOKED to UNCHOKED state\n", .{});
+                    }
+
                     is_choked = false;
 
                     // Request a piece if we don't have one in progress
                     if (current_piece == null) {
                         current_piece = self.piece_manager.getNextNeededPiece();
                         if (current_piece) |piece_index| {
-                            debug.print("Requesting piece {}\n", .{piece_index});
+                            debug.print("DOWNLOAD INITIAL: Requesting first piece {}\n", .{piece_index});
                             self.piece_manager.requestPiece(peer, piece_index) catch |err| {
                                 debug.print("Failed to request piece: {}\n", .{err});
                                 current_piece = null;
                             };
+                        } else {
+                            debug.print("DOWNLOAD COMPLETE: No more pieces needed\n", .{});
                         }
                     }
                 },
                 .piece => |piece| {
-                    debug.print("Received piece {} (offset: {}, size: {})\n", .{ piece.index, piece.begin, piece.block.len });
+                    debug.print("DOWNLOAD PROGRESS: Received block for piece {} (offset: {}, size: {})\n", .{ piece.index, piece.begin, piece.block.len });
 
                     try self.file_io.writeBlock(piece.index, piece.begin, piece.block);
                     self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block);
 
                     // If we've completed the current piece, request another one
                     if (current_piece != null and self.piece_manager.hasPiece(current_piece.?)) {
+                        debug.print("DOWNLOAD PROGRESS: Piece {} completed, moving to next piece\n", .{current_piece.?});
                         current_piece = self.piece_manager.getNextNeededPiece();
                         if (current_piece) |piece_index| {
-                            debug.print("Requesting next piece {}\n", .{piece_index});
+                            debug.print("DOWNLOAD PROGRESS: Requesting next piece {}\n", .{piece_index});
                             self.piece_manager.requestPiece(peer, piece_index) catch |err| {
                                 debug.print("Failed to request piece: {}\n", .{err});
                                 current_piece = null;
@@ -175,7 +241,7 @@ pub const PeerManager = struct {
                     }
                 },
                 .choke => {
-                    debug.print("Peer choked us\n", .{});
+                    debug.print("DOWNLOAD STATE: Peer choked us - can't request pieces until unchoked\n", .{});
                     is_choked = true;
                     current_piece = null;
                 },
@@ -264,6 +330,13 @@ pub const PeerManager = struct {
                         current_piece = null;
                     };
                 }
+            } else if (is_choked and !has_sent_interested) {
+                // If we're still choked and haven't sent interested, send it now
+                debug.print("Still choked, sending interested message...\n", .{});
+                peer.sendMessage(.interested) catch |err| {
+                    debug.print("Failed to send interested message: {}\n", .{err});
+                };
+                has_sent_interested = true;
             }
         }
         debug.print("Download complete for this peer\n", .{});

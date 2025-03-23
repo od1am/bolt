@@ -124,7 +124,7 @@ pub const PieceManager = struct {
             break :blk @as(u32, @min(@as(u32, @intCast(remaining)), @as(u32, @intCast(self.piece_length))));
         } else @as(u32, @intCast(self.piece_length));
 
-        std.debug.print("Requesting piece {} (size: {})\n", .{ piece_index, piece_size });
+        std.debug.print("DOWNLOAD STARTED: Requesting piece {} (size: {})\n", .{ piece_index, piece_size });
 
         // Create a new piece entry if it doesn't exist
         if (!self.in_progress_pieces.contains(piece_index)) {
@@ -159,7 +159,7 @@ pub const PieceManager = struct {
         const piece = self.in_progress_pieces.get(piece_index).?;
         for (piece.blocks) |block| {
             if (!block.received) {
-                std.debug.print("Requesting block: piece={}, offset={}, length={}\n", .{ piece_index, block.begin, block.length });
+                std.debug.print("DOWNLOAD REQUEST: Requesting block for piece={}, offset={}, length={}\n", .{ piece_index, block.begin, block.length });
                 try peer.sendMessage(PeerMessage{
                     .request = .{
                         .index = @intCast(piece_index),
@@ -194,18 +194,16 @@ pub const PieceManager = struct {
                     return;
                 }
 
-                // Store the block data
-                block.data = self.allocator.dupe(u8, block_data) catch {
-                    std.debug.print("Failed to allocate memory for block data\n", .{});
-                    return;
-                };
+                // Copy the block data instead of duplicating to prevent memory leaks
+                @memcpy(block.data[0..block_data.len], block_data);
                 block.received = true;
                 piece.received_blocks += 1;
 
-                std.debug.print("Received block {}/{} for piece {}\n", .{ piece.received_blocks, piece.total_blocks, idx });
+                std.debug.print("DOWNLOAD PROGRESS: Received block {}/{} for piece {} (offset: {}, size: {})\n", .{ piece.received_blocks, piece.total_blocks, idx, begin, block_data.len });
 
                 // Check if piece is complete
                 if (piece.received_blocks == piece.total_blocks) {
+                    std.debug.print("DOWNLOAD MILESTONE: All blocks for piece {} received, verifying...\n", .{idx});
                     self.processPiece(piece) catch |err| {
                         std.debug.print("Failed to process piece {}: {}\n", .{ idx, err });
                     };
@@ -218,7 +216,7 @@ pub const PieceManager = struct {
     }
 
     fn processPiece(self: *PieceManager, piece: *Piece) !void {
-        std.debug.print("Processing complete piece {}\n", .{piece.index});
+        std.debug.print("DOWNLOAD VERIFICATION: Processing complete piece {}\n", .{piece.index});
 
         // Calculate total size of the piece
         var total_size: usize = 0;
@@ -238,7 +236,7 @@ pub const PieceManager = struct {
 
         // Verify the piece hash
         if (self.verifyPiece(piece.index, piece_data)) {
-            std.debug.print("Piece {} verified successfully\n", .{piece.index});
+            std.debug.print("DOWNLOAD SUCCESS: Piece {} verified successfully\n", .{piece.index});
 
             // Write each block to disk
             offset = 0;
@@ -247,6 +245,7 @@ pub const PieceManager = struct {
                 try self.file_handle.writeAll(block.data[0..block.length]);
                 offset += block.length;
             }
+            std.debug.print("DOWNLOAD WRITE: Piece {} written to disk\n", .{piece.index});
 
             // Mark the piece as complete
             self.markPieceComplete(piece.index);
