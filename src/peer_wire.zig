@@ -44,6 +44,7 @@ pub const PeerConnection = struct {
     allocator: Allocator,
 
     pub fn deinit(self: *PeerConnection) void {
+        // Close the socket and ignore any errors that might occur
         self.socket.close();
     }
 
@@ -104,7 +105,7 @@ pub const PeerConnection = struct {
         if (length == 0) return .keep_alive;
 
         var message_buf = try self.allocator.alloc(u8, length);
-        errdefer self.allocator.free(message_buf);
+        defer self.allocator.free(message_buf);
 
         // Ensure we read exactly 'length' bytes
         var total_read: usize = 0;

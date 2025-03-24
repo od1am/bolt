@@ -14,18 +14,11 @@ A BitTorrent client implementation written in Zig.
 
 ```sh
 # Download a torrent
-./bolt --torrent /torrent/file/path
-
-# Create a torrent from a file or directory
-./bolt create path/to/file --output my_file.torrent
-
-# Seed a torrent
-./bolt seed path/to/file.torrent
-```
+./bolt -t /torrent/file/path -o /download/directory
 
 ## Building from Source
 
-Requires Zig 0.13.0 or later.
+Requires Zig version 0.13.0 or later.
 
 ```sh
 zig build
@@ -39,16 +32,16 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ### Core Functionality (In Progress)
 - [x] Bencode decoder
-- [ ] Pipelined Requests
 - [ ] Concurrency
 - [ ] Stable networking layer with proper connection handling
 - [x] Basic peer discovery and connection management
-- [ ] Reliable piece downloading and verification
+- [x] Reliable piece downloading and verification
 - [ ] Complete DHT bootstrapping process
 
 ### Phase 1: Basic Client Stability
 - [ ] Implement robust error handling throughout codebase
 - [ ] Add proper logging system
+- [ ] Non-sequential downloads
 - [ ] Support resume of partial downloads
 - [ ] Basic rate limiting implementation
 - [ ] Improve peer selection algorithm

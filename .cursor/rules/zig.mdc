@@ -8,4 +8,4 @@ alwaysApply: true
 
 - Use zig version 0.13
 - Always make sure to use existing functions and add no external dependencies
- 
+- Dont assume things and allways search for the documentation

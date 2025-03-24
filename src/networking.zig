@@ -31,6 +31,8 @@ pub const PeerManager = struct {
     peers: ArrayList(PeerConnection),
     peer_id: [20]u8,
     info_hash: [20]u8,
+    active_peers: std.atomic.Value(usize),
+    mutex: std.Thread.Mutex,
 
     pub fn init(
         allocator: Allocator,
@@ -48,6 +50,8 @@ pub const PeerManager = struct {
             .peers = ArrayList(PeerConnection).init(allocator),
             .peer_id = peer_id,
             .info_hash = info_hash,
+            .active_peers = std.atomic.Value(usize).init(0),
+            .mutex = std.Thread.Mutex{},
         };
     }
 
@@ -58,18 +62,44 @@ pub const PeerManager = struct {
         self.peers.deinit();
     }
 
+    pub fn getActivePeerCount(self: *PeerManager) usize {
+        return self.active_peers.load(.acquire);
+    }
+
     // Connect to a peer and add it to the list
     pub fn connectToPeer(self: *PeerManager, address: net.Address) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var ip_buf: [100]u8 = undefined;
         const ip = try std.fmt.bufPrint(&ip_buf, "{}", .{address});
 
         debug.print("Attempting to connect to peer {s}\n", .{ip});
 
-        // Create a socket
+        // Create a socket with a shorter timeout
         const socket = if (local_address) |local_addr| blk: {
             // Create an unconnected socket
             const sock = try posix.socket(local_addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-            errdefer posix.close(sock);
+            errdefer {
+                // Safely close the socket - in Zig 0.13 posix.close doesn't return an error
+                posix.close(sock);
+            }
+
+            // Set a connection timeout - this helps with stalled connections
+            if (@hasDecl(posix, "SO_RCVTIMEO")) {
+                const timeout = posix.timeval{
+                    .tv_sec = 3, // 3 second connection timeout
+                    .tv_usec = 0,
+                };
+                posix.setsockopt(
+                    sock,
+                    posix.SOL.SOCKET,
+                    posix.SO.RCVTIMEO,
+                    std.mem.asBytes(&timeout),
+                ) catch |err| {
+                    debug.print("Warning: Failed to set socket timeout: {}\n", .{err});
+                };
+            }
 
             // Bind to the local address
             try posix.bind(sock, &local_addr.any, local_addr.getOsSockLen());
@@ -82,12 +112,15 @@ pub const PeerManager = struct {
             debug.print("Failed to connect to peer {s}: {}\n", .{ ip, err });
             return err;
         };
-        errdefer socket.close();
+        errdefer {
+            // Safely close the socket - in Zig 0.13 std.net.Stream.close() also returns void
+            socket.close();
+        }
 
         // For non-blocking socket operations, we'll use a manual timer approach
         // instead of relying on socket options that may vary across Zig versions
         const start_time = std.time.milliTimestamp();
-        const timeout_ms = 3000; // 3 seconds timeout
+        const timeout_ms = 5000; // 5 seconds timeout for handshake (increased from 3s)
 
         var peer = PeerConnection{
             .socket = socket,
@@ -101,11 +134,14 @@ pub const PeerManager = struct {
             const elapsed = std.time.milliTimestamp() - start_time;
             if (elapsed >= timeout_ms) {
                 debug.print("Handshake timed out after {} ms for peer {s}\n", .{ elapsed, ip });
-                peer.deinit();
-                return error.ConnectionTimeout;
+            } else {
+                debug.print("Handshake failed with peer {s}: {}\n", .{ ip, err });
             }
-            debug.print("Handshake failed with peer {s}: {}\n", .{ ip, err });
-            peer.deinit();
+
+            // Safely close the socket, catching any potential errors
+            debug.print("Closing socket after handshake failure\n", .{});
+            socket.close();
+
             return err;
         };
 
@@ -117,6 +153,9 @@ pub const PeerManager = struct {
     pub fn startDownload(self: *PeerManager) !void {
         debug.print("Starting download with {} connected peers\n", .{self.peers.items.len});
 
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         for (self.peers.items) |*peer| {
             debug.print("Sending interested message to peer\n", .{});
             try peer.sendMessage(.interested);
@@ -126,8 +165,31 @@ pub const PeerManager = struct {
         }
     }
 
+    // Add a new peer to the download process (for newly connected peers)
+    pub fn addPeerToDownload(self: *PeerManager, peer_index: usize) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (peer_index >= self.peers.items.len) {
+            return error.InvalidPeerIndex;
+        }
+
+        var peer = &self.peers.items[peer_index];
+        debug.print("Adding new peer to download process\n", .{});
+        try peer.sendMessage(.interested);
+
+        const thread = try std.Thread.spawn(.{}, handlePeer, .{ self, peer });
+        thread.detach();
+    }
+
     // Handle messages from a single peer (runs in a separate thread)
     fn handlePeer(self: *PeerManager, peer: *PeerConnection) !void {
+        _ = self.active_peers.fetchAdd(1, .acq_rel);
+        defer {
+            _ = self.active_peers.fetchSub(1, .acq_rel);
+            debug.print("Peer disconnected, active peers: {}\n", .{self.active_peers.load(.acquire)});
+        }
+
         defer peer.deinit();
         var peer_has_pieces = std.ArrayList(usize).init(self.allocator);
         defer peer_has_pieces.deinit();

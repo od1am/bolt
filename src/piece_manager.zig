@@ -155,8 +155,11 @@ pub const PieceManager = struct {
             try self.in_progress_pieces.put(piece_index, piece);
         }
 
-        // Request all blocks for this piece
+        // Request only the blocks that haven't been received yet
         const piece = self.in_progress_pieces.get(piece_index).?;
+        var requested_blocks: usize = 0;
+        const max_requests = 16; // Don't request too many blocks at once to avoid overwhelming the peer
+
         for (piece.blocks) |block| {
             if (!block.received) {
                 std.debug.print("DOWNLOAD REQUEST: Requesting block for piece={}, offset={}, length={}\n", .{ piece_index, block.begin, block.length });
@@ -167,7 +170,17 @@ pub const PieceManager = struct {
                         .length = block.length,
                     },
                 });
+
+                requested_blocks += 1;
+                if (requested_blocks >= max_requests) {
+                    break; // Don't request too many at once
+                }
             }
+        }
+
+        if (requested_blocks == 0 and piece.received_blocks < piece.total_blocks) {
+            // Something went wrong, the piece should have unreceived blocks
+            std.debug.print("Warning: No blocks to request for piece {}, but piece is not complete ({}/{} blocks)\n", .{ piece_index, piece.received_blocks, piece.total_blocks });
         }
     }
 
@@ -284,13 +297,55 @@ pub const PieceManager = struct {
     }
 
     pub fn getNextNeededPiece(self: *PieceManager) ?usize {
+        // First, try to find a piece that isn't in progress and hasn't been downloaded
+        var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        const random = rng.random();
+
+        // Collect all available pieces
+        var available_pieces = std.ArrayList(usize).init(self.allocator);
+        defer available_pieces.deinit();
+
+        // Find pieces that are not downloaded and not in progress
         var i: usize = 0;
         while (i < self.total_pieces) : (i += 1) {
             if (!self.hasPiece(i) and !self.in_progress_pieces.contains(i)) {
-                std.debug.print("Next needed piece: {}\n", .{i});
-                return i;
+                available_pieces.append(i) catch {
+                    continue; // If we can't append, just try the next piece
+                };
             }
         }
+
+        // If there are available pieces, select one randomly
+        if (available_pieces.items.len > 0) {
+            const random_index = random.intRangeLessThan(usize, 0, available_pieces.items.len);
+            const piece = available_pieces.items[random_index];
+            std.debug.print("Next needed piece: {} (chosen from {} available pieces)\n", .{ piece, available_pieces.items.len });
+            return piece;
+        }
+
+        // If no completely free pieces, look for pieces with the fewest blocks received
+        // (this helps distribute work across peers more efficiently)
+        if (self.in_progress_pieces.count() > 0) {
+            var min_blocks: usize = std.math.maxInt(usize);
+            var min_piece: ?usize = null;
+
+            var it = self.in_progress_pieces.iterator();
+            while (it.next()) |entry| {
+                const piece_index = entry.key_ptr.*;
+                const piece = entry.value_ptr.*;
+
+                if (piece.received_blocks < min_blocks) {
+                    min_blocks = piece.received_blocks;
+                    min_piece = piece_index;
+                }
+            }
+
+            if (min_piece != null) {
+                std.debug.print("Resuming in-progress piece: {} (has {} of {} blocks)\n", .{ min_piece.?, min_blocks, self.in_progress_pieces.get(min_piece.?).?.total_blocks });
+                return min_piece;
+            }
+        }
+
         std.debug.print("No more pieces needed\n", .{});
         return null;
     }
