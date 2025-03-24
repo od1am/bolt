@@ -8,6 +8,8 @@ const PieceManager = @import("piece_manager.zig").PieceManager;
 const FileIO = @import("file_io.zig").FileIO;
 const tracker = @import("tracker.zig");
 const net = std.net;
+const posix = std.posix;
+const os = std.os;
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -121,32 +123,123 @@ pub fn main() !void {
     var last_connect_time = std.time.milliTimestamp();
     var next_peer_report_time = std.time.milliTimestamp();
     var last_progress_check_time = std.time.milliTimestamp();
+    var last_tracker_time = std.time.milliTimestamp();
     var last_download_count: usize = 0;
+
+    // Tracker update configuration
+    const tracker_update_interval = 5 * 60 * 1000; // Update tracker list every 5 minutes
+    var peer_list = std.ArrayList(net.Address).init(allocator);
+    defer peer_list.deinit();
+    for (peers) |peer| {
+        try peer_list.append(peer);
+    }
 
     // Number of connections to maintain simultaneously
     var max_connections: usize = 10;
     const max_connections_limit: usize = 30; // Hard limit to avoid too many connections
 
+    // Create a random number generator for better peer selection
+    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    const random = rng.random();
+
     while (!piece_manager.isDownloadComplete()) {
         const current_time = std.time.milliTimestamp();
 
+        // Periodically request new peers from the tracker
+        if (current_time - last_tracker_time > tracker_update_interval) {
+            std.debug.print("Requesting updated peer list from tracker...\n", .{});
+
+            const updated_params = tracker.RequestParams{
+                .info_hash = info_hash,
+                .peer_id = conf.peer_id,
+                .port = conf.listen_port,
+                .uploaded = 0,
+                .downloaded = piece_manager.downloaded_pieces * piece_manager.piece_length,
+                .left = total_size - (piece_manager.downloaded_pieces * piece_manager.piece_length),
+                .compact = true,
+            };
+
+            const updated_response = tracker.requestPeers(allocator, &torrent_file, updated_params) catch |err| {
+                std.debug.print("Failed to update tracker: {}\n", .{err});
+                last_tracker_time = current_time; // Update time anyway to avoid retry spam
+                continue; // Skip the rest of this block
+            };
+
+            defer allocator.free(updated_response.peers);
+
+            // Add new peers to our list
+            const new_peers = try network.parseCompactPeers(allocator, updated_response.peers);
+            defer allocator.free(new_peers);
+
+            // Track how many new peers we found
+            var new_peer_count: usize = 0;
+
+            // Add each new peer if we don't already have it
+            for (new_peers) |new_peer| {
+                var is_duplicate = false;
+
+                // Convert new peer to string for comparison
+                var new_peer_buf: [100]u8 = undefined;
+                const new_peer_str = std.fmt.bufPrint(&new_peer_buf, "{}", .{new_peer}) catch continue;
+
+                for (peer_list.items) |existing_peer| {
+                    // Convert existing peer to string
+                    var existing_peer_buf: [100]u8 = undefined;
+                    const existing_peer_str = std.fmt.bufPrint(&existing_peer_buf, "{}", .{existing_peer}) catch continue;
+
+                    // Compare string representations
+                    if (std.mem.eql(u8, new_peer_str, existing_peer_str)) {
+                        is_duplicate = true;
+                        break;
+                    }
+                }
+
+                if (!is_duplicate) {
+                    try peer_list.append(new_peer);
+                    new_peer_count += 1;
+                }
+            }
+
+            std.debug.print("Added {} new peers from tracker update, now have {} total peers\n", .{ new_peer_count, peer_list.items.len });
+
+            // Reset the connection index if we have new peers
+            if (new_peer_count > 0) {
+                connect_index = peer_manager.peers.items.len;
+            }
+
+            last_tracker_time = current_time;
+        }
+
         // Add more peers every 5 seconds if download is going well
-        if (current_time - last_connect_time > 5000 and connect_index < peers.len) {
+        if (current_time - last_connect_time > 5000 and connect_index < peer_list.items.len) {
             const active_peers = peer_manager.getActivePeerCount();
 
             // Only add more peers if we're below our target
             if (active_peers < max_connections) {
                 var connected_new_peer = false;
-                const peers_to_try = @min(3, peers.len - connect_index); // Try up to 3 peers at once
+                const peers_to_try = @min(3, peer_list.items.len - connect_index); // Try up to 3 peers at once
 
                 var tries: usize = 0;
                 while (tries < peers_to_try) : ({
                     tries += 1;
-                    connect_index += 1;
                 }) {
-                    if (connect_index >= peers.len) break;
+                    // Use a random selection strategy for better distribution
+                    var selected_index: usize = 0;
 
-                    const peer_addr = peers[connect_index];
+                    if (peer_list.items.len - connect_index > 10) {
+                        // If we have lots of peers left, pick randomly from the remaining ones
+                        selected_index = connect_index + random.intRangeLessThan(usize, 0, peer_list.items.len - connect_index);
+                    } else {
+                        selected_index = connect_index;
+                        connect_index += 1;
+                    }
+
+                    // Make sure the selected index is valid
+                    if (selected_index >= peer_list.items.len) {
+                        break;
+                    }
+
+                    const peer_addr = peer_list.items[selected_index];
                     std.debug.print("Connecting to additional peer {}\n", .{peer_addr});
 
                     peer_manager.connectToPeer(peer_addr) catch |err| {
@@ -161,6 +254,9 @@ pub fn main() !void {
                     };
 
                     connected_new_peer = true;
+
+                    // Wait a short time between connection attempts to avoid overwhelming the network
+                    std.time.sleep(100 * std.time.ns_per_ms);
                 }
 
                 if (connected_new_peer) {

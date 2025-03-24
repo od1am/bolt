@@ -198,8 +198,13 @@ pub const PeerManager = struct {
         var has_sent_interested = false;
         var current_piece: ?usize = null;
         var last_message_time = std.time.milliTimestamp();
-        const timeout_ms = 60 * 1000; // 60 seconds timeout
+        var last_piece_progress_time = std.time.milliTimestamp();
+        const timeout_ms = 60 * 1000; // 60 seconds timeout for general inactivity
+        const piece_timeout_ms = 30 * 1000; // 30 seconds timeout for piece progress
         var consecutive_errors: u8 = 0;
+        var blocks_received: usize = 0;
+        var last_blocks_received: usize = 0;
+        var sent_requests: usize = 0;
 
         // Send initial interested message (ensure we're registered as interested)
         peer.sendMessage(.interested) catch |err| {
@@ -211,9 +216,38 @@ pub const PeerManager = struct {
         while (!self.piece_manager.isDownloadComplete()) {
             // Check for timeout
             const current_time = std.time.milliTimestamp();
+
+            // Global timeout check
             if (current_time - last_message_time > timeout_ms) {
                 debug.print("Peer connection timed out after {} seconds\n", .{timeout_ms / 1000});
                 break;
+            }
+
+            // Check for piece download progress (stalled download)
+            if (!is_choked and current_piece != null) {
+                if (current_time - last_piece_progress_time > piece_timeout_ms and
+                    blocks_received == last_blocks_received and
+                    sent_requests > 0)
+                {
+                    debug.print("Piece {} download stalled for {} seconds, requesting a different piece\n", .{ current_piece.?, piece_timeout_ms / 1000 });
+
+                    // Reset the piece request counters
+                    sent_requests = 0;
+                    blocks_received = 0;
+                    last_blocks_received = 0;
+
+                    // Get a different piece
+                    current_piece = self.piece_manager.getNextNeededPiece();
+                    if (current_piece) |piece_index| {
+                        debug.print("Trying different piece: {}\n", .{piece_index});
+                        self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                            debug.print("Failed to request new piece: {}\n", .{err});
+                            current_piece = null;
+                        };
+                    }
+
+                    last_piece_progress_time = current_time;
+                }
             }
 
             // Set a read timeout on the socket
@@ -223,25 +257,43 @@ pub const PeerManager = struct {
 
             var message = peer.readMessage() catch |err| {
                 if (err == error.WouldBlock or err == error.TimedOut) {
-                    // Send keep-alive to keep the connection active
-                    debug.print("No message received in 5 seconds, sending keep-alive...\n", .{});
-                    peer.sendMessage(.keep_alive) catch {};
+                    // Only send keep-alive if we haven't sent anything recently
+                    if (current_time - last_message_time > 30000) { // 30 seconds
+                        debug.print("No message for 30 seconds, sending keep-alive...\n", .{});
+                        peer.sendMessage(.keep_alive) catch {};
+                    }
 
                     // If we're still choked, resend interested message periodically
                     if (is_choked and current_time - last_message_time > 15000) {
                         debug.print("Still choked after 15 seconds, resending interested message...\n", .{});
                         peer.sendMessage(.interested) catch {};
+                        has_sent_interested = true;
                         last_message_time = current_time; // Reset timer
                     }
 
+                    // If we're unchoked but no piece progress, try requesting pieces again
+                    if (!is_choked and current_piece != null and
+                        current_time - last_piece_progress_time > 10000 and // 10 seconds with no progress
+                        blocks_received == last_blocks_received)
+                    {
+                        debug.print("No block progress for 10 seconds, re-requesting blocks for piece {}...\n", .{current_piece.?});
+
+                        self.piece_manager.requestPiece(peer, current_piece.?) catch |request_err| {
+                            debug.print("Failed to re-request piece: {}\n", .{request_err});
+                        };
+
+                        sent_requests += 1;
+                    }
+
                     consecutive_errors = 0;
+                    std.time.sleep(500 * std.time.ns_per_ms); // 500ms wait before retry
                     continue;
                 }
 
                 consecutive_errors += 1;
-                debug.print("Error reading message from peer: {} (attempt {}/3)\n", .{ err, consecutive_errors });
+                debug.print("Error reading message from peer: {} (attempt {}/5)\n", .{ err, consecutive_errors });
 
-                if (consecutive_errors >= 3) {
+                if (consecutive_errors >= 5) {
                     debug.print("Too many consecutive errors, disconnecting peer\n", .{});
                     break;
                 }
@@ -256,7 +308,7 @@ pub const PeerManager = struct {
             consecutive_errors = 0;
 
             // Update last message time
-            last_message_time = std.time.milliTimestamp();
+            last_message_time = current_time;
 
             switch (message) {
                 .unchoke => {
@@ -268,23 +320,61 @@ pub const PeerManager = struct {
                     }
 
                     is_choked = false;
+                    last_piece_progress_time = current_time;
 
                     // Request a piece if we don't have one in progress
                     if (current_piece == null) {
-                        current_piece = self.piece_manager.getNextNeededPiece();
-                        if (current_piece) |piece_index| {
-                            debug.print("DOWNLOAD INITIAL: Requesting first piece {}\n", .{piece_index});
-                            self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                                debug.print("Failed to request piece: {}\n", .{err});
-                                current_piece = null;
-                            };
-                        } else {
-                            debug.print("DOWNLOAD COMPLETE: No more pieces needed\n", .{});
+                        // First try pieces that this peer has
+                        var found_piece = false;
+
+                        if (peer_has_pieces.items.len > 0) {
+                            // Use a random selection from the peer's pieces for better distribution
+                            var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+                            const random = rng.random();
+
+                            const tries = @min(10, peer_has_pieces.items.len); // Try up to 10 random pieces
+                            var i: usize = 0;
+                            while (i < tries) : (i += 1) {
+                                const random_index = random.intRangeLessThan(usize, 0, peer_has_pieces.items.len);
+                                const candidate_piece = peer_has_pieces.items[random_index];
+
+                                if (!self.piece_manager.hasPiece(candidate_piece)) {
+                                    current_piece = candidate_piece;
+                                    debug.print("DOWNLOAD INITIAL: Requesting piece {} (peer has it)\n", .{candidate_piece});
+                                    self.piece_manager.requestPiece(peer, candidate_piece) catch |err| {
+                                        debug.print("Failed to request piece: {}\n", .{err});
+                                        current_piece = null;
+                                        continue;
+                                    };
+                                    found_piece = true;
+                                    sent_requests += 1;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // If we couldn't find a piece the peer has, get any needed piece
+                        if (!found_piece) {
+                            current_piece = self.piece_manager.getNextNeededPiece();
+                            if (current_piece) |piece_index| {
+                                debug.print("DOWNLOAD INITIAL: Requesting first piece {}\n", .{piece_index});
+                                self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                    debug.print("Failed to request piece: {}\n", .{err});
+                                    current_piece = null;
+                                };
+                                sent_requests += 1;
+                            } else {
+                                debug.print("DOWNLOAD COMPLETE: No more pieces needed\n", .{});
+                            }
                         }
                     }
                 },
                 .piece => |piece| {
                     debug.print("DOWNLOAD PROGRESS: Received block for piece {} (offset: {}, size: {})\n", .{ piece.index, piece.begin, piece.block.len });
+
+                    // Update block counters
+                    blocks_received += 1;
+                    last_piece_progress_time = current_time;
 
                     try self.file_io.writeBlock(piece.index, piece.begin, piece.block);
                     self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block);
@@ -292,20 +382,70 @@ pub const PeerManager = struct {
                     // If we've completed the current piece, request another one
                     if (current_piece != null and self.piece_manager.hasPiece(current_piece.?)) {
                         debug.print("DOWNLOAD PROGRESS: Piece {} completed, moving to next piece\n", .{current_piece.?});
-                        current_piece = self.piece_manager.getNextNeededPiece();
-                        if (current_piece) |piece_index| {
-                            debug.print("DOWNLOAD PROGRESS: Requesting next piece {}\n", .{piece_index});
-                            self.piece_manager.requestPiece(peer, piece_index) catch |err| {
-                                debug.print("Failed to request piece: {}\n", .{err});
-                                current_piece = null;
-                            };
+
+                        // Reset counters for the new piece
+                        blocks_received = 0;
+                        last_blocks_received = 0;
+                        sent_requests = 0;
+
+                        // Try to find a piece this peer has that we need
+                        var found_piece = false;
+                        if (peer_has_pieces.items.len > 0) {
+                            var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+                            const random = rng.random();
+
+                            const tries = @min(10, peer_has_pieces.items.len);
+                            var i: usize = 0;
+                            while (i < tries) : (i += 1) {
+                                const random_index = random.intRangeLessThan(usize, 0, peer_has_pieces.items.len);
+                                const candidate_piece = peer_has_pieces.items[random_index];
+
+                                if (!self.piece_manager.hasPiece(candidate_piece)) {
+                                    current_piece = candidate_piece;
+                                    debug.print("DOWNLOAD PROGRESS: Requesting piece {} (peer has it)\n", .{candidate_piece});
+                                    self.piece_manager.requestPiece(peer, candidate_piece) catch |err| {
+                                        debug.print("Failed to request piece: {}\n", .{err});
+                                        current_piece = null;
+                                        continue;
+                                    };
+                                    found_piece = true;
+                                    sent_requests += 1;
+                                    break;
+                                }
+                            }
                         }
+
+                        // Fall back to any needed piece
+                        if (!found_piece) {
+                            current_piece = self.piece_manager.getNextNeededPiece();
+                            if (current_piece) |piece_index| {
+                                debug.print("DOWNLOAD PROGRESS: Requesting next piece {}\n", .{piece_index});
+                                self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                    debug.print("Failed to request piece: {}\n", .{err});
+                                    current_piece = null;
+                                };
+                                sent_requests += 1;
+                            }
+                        }
+                    }
+                    // If this is a piece we're actively downloading, track block reception
+                    else if (current_piece != null and piece.index == current_piece.?) {
+                        last_blocks_received = blocks_received;
+                    }
+                    // If we got a block for a different piece than the one we're tracking
+                    else if (current_piece != null and piece.index != current_piece.?) {
+                        debug.print("Received block for piece {} but tracking piece {}\n", .{ piece.index, current_piece.? });
                     }
                 },
                 .choke => {
                     debug.print("DOWNLOAD STATE: Peer choked us - can't request pieces until unchoked\n", .{});
                     is_choked = true;
-                    current_piece = null;
+
+                    // We can't request more blocks for now, but we don't reset current_piece
+                    // This allows us to track the piece we were working on before being choked
+
+                    // Reset the request counters
+                    sent_requests = 0;
                 },
                 .interested => {
                     debug.print("Peer is interested\n", .{});
