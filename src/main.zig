@@ -36,17 +36,27 @@ pub fn main() !void {
     var file_io = try FileIO.init(allocator, files, torrent_file.info.piece_length, conf.output_dir);
     defer file_io.deinit();
 
-    const output_file_path = try std.fs.path.join(allocator, &[_][]const u8{ conf.output_dir, torrent_file.info.name });
-    defer allocator.free(output_file_path);
+    // For multi-file torrents, we'll use the FileIO directly
+    // For single-file torrents, we'll still create a temp output file for the PieceManager
+    var output_file_path: ?[]const u8 = null;
+    defer if (output_file_path != null) allocator.free(output_file_path.?);
+
+    if (torrent_file.info.files == null) {
+        // Single file torrent - create the output path for the piece manager
+        output_file_path = try std.fs.path.join(allocator, &[_][]const u8{ conf.output_dir, torrent_file.info.name });
+    }
 
     var piece_manager = try PieceManager.init(
         allocator,
         torrent_file.info.piece_length,
         torrent_file.info.pieces.len / 20,
         try parsePieceHashes(allocator, torrent_file.info.pieces),
-        output_file_path,
+        output_file_path orelse "temp_data", // Use a placeholder if multi-file
     );
     defer piece_manager.deinit();
+
+    // Connect the FileIO to the PieceManager
+    piece_manager.setFileIO(&file_io);
 
     const info_hash = try torrent_file.calculateInfoHash();
     var peer_manager = network.PeerManager.init(
@@ -77,10 +87,15 @@ pub fn main() !void {
         .compact = true,
     };
 
-    const tracker_response = tracker.requestPeers(allocator, &torrent_file, params) catch |err| {
-        std.debug.print("Failed to connect to tracker: {}\n", .{err});
-        std.debug.print("Continuing with any hardcoded or known peers instead...\n", .{});
-        return err;
+    // Attempt to connect to main tracker
+    const tracker_response = blk: {
+        // Try primary tracker first
+        if (tracker.requestPeers(allocator, &torrent_file, params)) |response| {
+            std.debug.print("Successfully connected to primary tracker\n", .{});
+            break :blk response;
+        } else |err| {
+            std.debug.print("Failed to connect to tracker: {}\n", .{err});
+        }
     };
     defer allocator.free(tracker_response.peers);
 

@@ -15,6 +15,7 @@ A BitTorrent client implementation written in Zig.
 ```sh
 # Download a torrent
 ./bolt -t /torrent/file/path -o /download/directory
+```
 
 ## Building from Source
 
@@ -24,6 +25,9 @@ Requires Zig version 0.13.0 or later.
 zig build
 ```
 
+```sh
+nix run . -- -t /path/to/file.torrent -o downloads
+```
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

@@ -17,6 +17,13 @@ mkdir -p downloads
 
 # Run the BitTorrent client with the torrent file
 echo "Starting download..."
-./zig-out/bin/bolt -t torrent-file/debian-12.10.0-amd64-DVD-1.iso.torrent -o downloads
+./zig-out/bin/bolt -t /home/zor/projects/bolt/torrent-file/big-buck-bunny.torrent -o downloads
 
 echo "Download completed!" 
+
+# Check if the download is complete
+if [ -f "downloads/big-buck-bunny.torrent" ]; then
+    echo "Download is complete!"
+else
+    echo "Download is not complete!"
+fi

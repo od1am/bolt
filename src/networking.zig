@@ -13,6 +13,11 @@ const FileIO = @import("file_io.zig").FileIO;
 const TorrentFile = @import("torrent.zig").TorrentFile;
 const tracker_module = @import("tracker.zig");
 
+const protocol = enum protocol {
+    tcp,
+    udp,
+};
+
 // Optional local address to bind outgoing connections to
 var local_address: ?net.Address = null;
 

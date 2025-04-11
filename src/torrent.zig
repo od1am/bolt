@@ -109,8 +109,30 @@ fn extractFiles(allocator: Allocator, files_list: []BencodeValue) ![]File {
     var files = try allocator.alloc(File, files_list.len);
     for (files_list, 0..) |file_value, i| {
         if (file_value != .dict) return error.InvalidFormat;
-        const path = try extractString(allocator, file_value.dict, "path");
+
+        // Get the length first
         const length = try extractInteger(file_value.dict, "length");
+
+        // Handle the path field properly - it should be a list of path components
+        const path_value = file_value.dict.get("path") orelse return error.InvalidFormat;
+        if (path_value != .list) return error.InvalidFormat;
+
+        // Extract path from list of components
+        var path_buf = std.ArrayList(u8).init(allocator);
+        defer path_buf.deinit();
+
+        for (path_value.list, 0..) |component, j| {
+            if (component != .string) return error.InvalidFormat;
+            // Add path separator if not the first component
+            if (j > 0) {
+                try path_buf.append('/');
+            }
+            try path_buf.appendSlice(component.string);
+        }
+
+        // Duplicate the path string to ensure it's correctly allocated
+        const path = try allocator.dupe(u8, path_buf.items);
+
         files[i] = File{ .path = path, .length = length };
     }
     return files;

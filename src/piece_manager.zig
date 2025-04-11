@@ -3,6 +3,7 @@ const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
 const PeerMessage = @import("peer_wire.zig").PeerMessage;
 const PeerConnection = @import("peer_wire.zig").PeerConnection;
+const FileIO = @import("file_io.zig").FileIO;
 
 const Block = struct {
     data: []u8,
@@ -28,7 +29,8 @@ pub const PieceManager = struct {
     piece_hashes: []const [20]u8,
     bitfield: []u8,
     downloaded_pieces: usize,
-    file_handle: std.fs.File,
+    file_io: ?*FileIO,
+    file_handle: ?std.fs.File,
     in_progress_pieces: std.AutoHashMap(usize, *Piece),
     block_size: u32,
     mutex: std.Thread.Mutex, // Mutex to protect shared data structures
@@ -43,7 +45,11 @@ pub const PieceManager = struct {
         const bitfield = try allocator.alloc(u8, (total_pieces + 7) / 8);
         @memset(bitfield, 0);
 
-        const file_handle = try std.fs.cwd().createFile(output_file_path, .{ .truncate = true });
+        // Create a file handle only for single-file torrents
+        var file_handle: ?std.fs.File = null;
+        if (!std.mem.eql(u8, output_file_path, "temp_data")) {
+            file_handle = try std.fs.cwd().createFile(output_file_path, .{ .truncate = true });
+        }
 
         return PieceManager{
             .allocator = allocator,
@@ -52,6 +58,7 @@ pub const PieceManager = struct {
             .piece_hashes = piece_hashes,
             .bitfield = bitfield,
             .downloaded_pieces = 0,
+            .file_io = null,
             .file_handle = file_handle,
             .in_progress_pieces = std.AutoHashMap(usize, *Piece).init(allocator),
             .block_size = 16 * 1024, // 16KB blocks
@@ -73,7 +80,9 @@ pub const PieceManager = struct {
         }
         self.in_progress_pieces.deinit();
         self.allocator.free(self.bitfield);
-        self.file_handle.close();
+        if (self.file_handle) |*file_handle| {
+            file_handle.close();
+        }
     }
 
     pub fn hasPiece(self: *PieceManager, piece_index: usize) bool {
@@ -116,9 +125,17 @@ pub const PieceManager = struct {
     }
 
     pub fn writePiece(self: *PieceManager, piece_index: usize, piece_data: []const u8) !void {
-        const offset = piece_index * self.piece_length;
-        try self.file_handle.seekTo(offset);
-        try self.file_handle.writeAll(piece_data);
+        if (self.file_io) |file_io| {
+            // Use the FileIO for multi-file torrents
+            try file_io.writeBlock(piece_index, 0, piece_data);
+        } else if (self.file_handle) |*file_handle| {
+            // For single-file torrents, use direct file handle
+            const offset = piece_index * self.piece_length;
+            try file_handle.seekTo(offset);
+            try file_handle.writeAll(piece_data);
+        } else {
+            return error.NoFileHandlerAvailable;
+        }
     }
 
     pub fn requestPiece(self: *PieceManager, peer: *PeerConnection, piece_index: usize) !void {
@@ -461,5 +478,10 @@ pub const PieceManager = struct {
                 std.debug.print("Cleaned up stale piece {}\n", .{key});
             }
         }
+    }
+
+    // Add method to set FileIO reference
+    pub fn setFileIO(self: *PieceManager, file_io: *FileIO) void {
+        self.file_io = file_io;
     }
 };

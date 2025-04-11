@@ -8,4 +8,5 @@ alwaysApply: true
 
 - Use zig version 0.13
 - Always make sure to use existing functions and add no external dependencies
-- Dont assume things and allways search for the documentation
+- Dont assume things and allways search for the documentation of the used zig version
+- If using a function from std, please check /usr/lib/zig for the functions before making a change
