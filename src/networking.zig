@@ -13,7 +13,7 @@ const FileIO = @import("file_io.zig").FileIO;
 const TorrentFile = @import("torrent.zig").TorrentFile;
 const tracker_module = @import("tracker.zig");
 
-const protocol = enum protocol {
+const Protocol = enum {
     tcp,
     udp,
 };
