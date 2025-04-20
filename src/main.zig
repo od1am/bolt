@@ -7,6 +7,7 @@ const network = @import("networking.zig");
 const PieceManager = @import("piece_manager.zig").PieceManager;
 const FileIO = @import("file_io.zig").FileIO;
 const tracker = @import("tracker.zig");
+const Metrics = @import("metrics.zig").Metrics;
 const net = std.net;
 const posix = std.posix;
 const os = std.os;
@@ -23,6 +24,22 @@ pub fn main() !void {
     defer allocator.free(data);
     var torrent_file = try torrent.parseTorrentFile(allocator, data);
     defer torrent_file.deinit(allocator);
+
+    // Print announce URL and announce-list for debugging
+    if (torrent_file.announce_url) |url| {
+        std.debug.print("Announce URL: {s}\n", .{url});
+    } else {
+        std.debug.print("No announce URL found\n", .{});
+    }
+
+    if (torrent_file.announce_list) |announce_list| {
+        std.debug.print("Found {} alternate trackers:\n", .{announce_list.len});
+        for (announce_list, 0..) |url, i| {
+            std.debug.print("  {}: {s}\n", .{i, url});
+        }
+    } else {
+        std.debug.print("No alternate trackers found\n", .{});
+    }
 
     const single_file = if (torrent_file.info.files == null)
         [_]torrent.File{.{
@@ -46,12 +63,17 @@ pub fn main() !void {
         output_file_path = try std.fs.path.join(allocator, &[_][]const u8{ conf.output_dir, torrent_file.info.name });
     }
 
+    // Create metrics collector
+    var metrics = Metrics.init(allocator);
+    defer metrics.deinit();
+
     var piece_manager = try PieceManager.init(
         allocator,
         torrent_file.info.piece_length,
         torrent_file.info.pieces.len / 20,
         try parsePieceHashes(allocator, torrent_file.info.pieces),
         output_file_path orelse "temp_data", // Use a placeholder if multi-file
+        &metrics,
     );
     defer piece_manager.deinit();
 
@@ -59,7 +81,8 @@ pub fn main() !void {
     piece_manager.setFileIO(&file_io);
 
     const info_hash = try torrent_file.calculateInfoHash();
-    var peer_manager = network.PeerManager.init(
+    // Create a simplified peer manager without thread pool to avoid issues
+    var peer_manager = try network.PeerManager.initSimple(
         allocator,
         torrent_file,
         &piece_manager,
@@ -87,40 +110,110 @@ pub fn main() !void {
         .compact = true,
     };
 
-    // Attempt to connect to main tracker
-    const tracker_response = blk: {
-        // Try primary tracker first
-        if (tracker.requestPeers(allocator, &torrent_file, params)) |response| {
-            std.debug.print("Successfully connected to primary tracker\n", .{});
-            break :blk response;
+    // Attempt to connect to trackers
+    var tracker_response: ?tracker.Response = null;
+
+    tracker_connect: {
+
+    // Add default trackers if none are found
+    var default_trackers = std.ArrayList([]const u8).init(allocator);
+    defer default_trackers.deinit();
+
+    if (torrent_file.announce_url == null and (torrent_file.announce_list == null or torrent_file.announce_list.?.len == 0)) {
+        std.debug.print("No trackers found in torrent file, adding default trackers\n", .{});
+
+        // Add some default trackers - prioritize more reliable ones
+        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.opentrackr.org:1337"));
+        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.openbittorrent.com:80"));
+        try default_trackers.append(try allocator.dupe(u8, "udp://exodus.desync.com:6969"));
+        try default_trackers.append(try allocator.dupe(u8, "udp://open.stealth.si:80"));
+        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.coppersurfer.tk:6969"));
+        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.leechers-paradise.org:6969"));
+
+        // Set as announce list
+        torrent_file.announce_list = try default_trackers.toOwnedSlice();
+    }
+
+    // Try to connect to the main tracker if available
+    if (torrent_file.announce_url) |announce_url| {
+        std.debug.print("Trying primary tracker: {s}...\n", .{announce_url});
+        if (tracker.requestPeersWithUrl(allocator, announce_url, params, "")) |response| {
+            tracker_response = response;
+            std.debug.print("Successfully connected to primary tracker, starting download...\n", .{});
+            // We have a successful tracker response, proceed with download
+            break :tracker_connect;
         } else |err| {
-            std.debug.print("Failed to connect to tracker: {}\n", .{err});
+            std.debug.print("Failed to connect to primary tracker: {}\n", .{err});
+            // Just continue with null tracker_response
         }
-    };
-    defer allocator.free(tracker_response.peers);
+    }
 
-    std.debug.print("Received {} bytes of peer data from tracker\n", .{tracker_response.peers.len});
+    // If primary tracker failed or doesn't exist, try alternate trackers
+    if (tracker_response == null and torrent_file.announce_list != null and torrent_file.announce_list.?.len > 0) {
+        std.debug.print("Trying alternate trackers...\n", .{});
 
-    const peers = try network.parseCompactPeers(allocator, tracker_response.peers);
+        for (torrent_file.announce_list.?) |announce_url| {
+            std.debug.print("Trying tracker: {s}\n", .{announce_url});
+
+            if (tracker.requestPeersWithUrl(allocator, announce_url, params, "")) |response| {
+                tracker_response = response;
+                std.debug.print("Successfully connected to alternate tracker, starting download...\n", .{});
+                // We have a successful tracker response, proceed with download
+                break :tracker_connect;
+            } else |alt_err| {
+                std.debug.print("Failed to connect to alternate tracker: {}\n", .{alt_err});
+                continue;
+            }
+        }
+    }
+
+    // If all trackers failed, return error
+    if (tracker_response == null) {
+        std.debug.print("Failed to connect to any trackers\n", .{});
+        return error.AllTrackersConnectionFailed;
+    }
+    } // End of tracker_connect block
+
+    defer allocator.free(tracker_response.?.peers);
+
+    std.debug.print("Received {} bytes of peer data from tracker\n", .{tracker_response.?.peers.len});
+
+    const peers = try network.parseCompactPeers(allocator, tracker_response.?.peers);
     defer allocator.free(peers);
 
     std.debug.print("Found {} peers\n", .{peers.len});
 
     var successful_connections: usize = 0;
-    const max_initial_connections = 5; // Only try to connect to 5 peers initially
+    const max_initial_connections = 20; // Try more peers initially
     var started_download = false;
 
-    // Connect to the first few peers
-    for (0..@min(peers.len, max_initial_connections)) |i| {
-        const peer_addr = peers[i];
+    std.debug.print("Attempting to connect to peers...\n", .{});
 
-        std.debug.print("Connecting to peer {}\n", .{peer_addr});
+    // Try to connect to peers
+    for (peers, 0..) |peer_addr, i| {
+        if (i >= max_initial_connections) break; // Limit initial connection attempts
+
+        std.debug.print("Connecting to peer {} ({}/{})\n", .{peer_addr, i+1, @min(peers.len, max_initial_connections)});
         peer_manager.connectToPeer(peer_addr) catch |err| {
             std.debug.print("Failed to connect to peer: {}\n", .{err});
             continue;
         };
 
         successful_connections += 1;
+        std.debug.print("Successfully connected to {} peers so far\n", .{successful_connections});
+
+        // Start the download as soon as we connect to the first successful peer
+        // This implements the requirement to start downloading after connecting to the first successful tracker
+        if (successful_connections == 1) {
+            std.debug.print("Starting download with first successful peer\n", .{});
+            try peer_manager.startDownload();
+            started_download = true;
+        }
+
+        // If we have at least 2 successful connections, we can stop connecting to more peers initially
+        if (successful_connections >= 2) {
+            break;
+        }
     }
 
     if (successful_connections == 0) {
@@ -128,10 +221,14 @@ pub fn main() !void {
         return;
     }
 
-    std.debug.print("Starting download with first peer\n", .{});
-    try peer_manager.startDownload();
+    std.debug.print("Connected to {} peers\n", .{successful_connections});
 
-    started_download = true;
+    // If we haven't started the download yet (which is unlikely), start it now
+    if (!started_download) {
+        std.debug.print("Starting download now\n", .{});
+        try peer_manager.startDownload();
+        started_download = true;
+    }
 
     // Set up dynamic peer connection strategy
     var connect_index: usize = max_initial_connections;
@@ -288,6 +385,9 @@ pub fn main() !void {
                 @as(f32, @floatFromInt(piece_manager.total_pieces)) * 100.0;
 
             std.debug.print("Download progress: {d:.1}% ({}/{} pieces) with {} active peers\n", .{ progress_percentage, piece_manager.downloaded_pieces, piece_manager.total_pieces, peer_manager.getActivePeerCount() });
+
+            // Print detailed metrics
+            peer_manager.printMetrics();
 
             next_peer_report_time = current_time;
         }

@@ -16,13 +16,13 @@ fi
 mkdir -p downloads
 
 # Run the BitTorrent client with the torrent file
-echo "Starting download..."
-./zig-out/bin/bolt -t /home/zor/projects/bolt/torrent-file/big-buck-bunny.torrent -o downloads
+echo "Starting download with improved networking architecture..."
+./zig-out/bin/bolt -t ./torrent-file/alice.torrent -o downloads
 
-echo "Download completed!" 
+echo "Download completed!"
 
 # Check if the download is complete
-if [ -f "downloads/big-buck-bunny.torrent" ]; then
+if [ -f "downloads/alice.txt" ]; then
     echo "Download is complete!"
 else
     echo "Download is not complete!"

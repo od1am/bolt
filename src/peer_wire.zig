@@ -63,6 +63,21 @@ pub const PeerConnection = struct {
         }
     }
 
+    pub fn setWriteTimeout(self: *PeerConnection, milliseconds: u32) !void {
+        if (@hasDecl(std.os, "SO_SNDTIMEO")) {
+            const timeout = std.posix.timeval{
+                .tv_sec = @intCast(milliseconds / 1000),
+                .tv_usec = @intCast((milliseconds % 1000) * 1000),
+            };
+            try std.posix.setsockopt(
+                self.socket.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.SNDTIMEO,
+                std.mem.asBytes(&timeout),
+            );
+        }
+    }
+
     pub fn handshake(self: *PeerConnection) !void {
         std.debug.print("Starting handshake with peer...\n", .{});
         var handshake_buffer: [68]u8 = undefined;
@@ -72,8 +87,16 @@ pub const PeerConnection = struct {
         @memcpy(handshake_buffer[28..48], &self.info_hash);
         @memcpy(handshake_buffer[48..68], &self.peer_id);
 
-        // Set a reasonable timeout for handshake
-        try self.setReadTimeout(10 * 1000); // 10 second timeout
+        // Print info hash for debugging
+        std.debug.print("Sending handshake with info_hash: ", .{});
+        for (self.info_hash) |b| {
+            std.debug.print("{x:0>2}", .{b});
+        }
+        std.debug.print("\n", .{});
+
+        // Set reasonable timeouts for handshake
+        try self.setReadTimeout(15 * 1000); // 15 second timeout (increased from 10)
+        try self.setWriteTimeout(15 * 1000); // Also set write timeout
 
         try self.socket.writeAll(&handshake_buffer);
 
@@ -84,6 +107,15 @@ pub const PeerConnection = struct {
             std.debug.print("Invalid handshake response length: expected 68, got {}\n", .{bytes_read});
             return error.HandshakeFailed;
         }
+
+        // Print received handshake info
+        std.debug.print("Received handshake response:\n", .{});
+        std.debug.print("  Protocol: {s}\n", .{response[1..20]});
+        std.debug.print("  Info hash: ", .{});
+        for (response[28..48]) |b| {
+            std.debug.print("{x:0>2}", .{b});
+        }
+        std.debug.print("\n", .{});
 
         if (!std.mem.eql(u8, response[1..20], "BitTorrent protocol")) {
             std.debug.print("Invalid protocol identifier in handshake\n", .{});

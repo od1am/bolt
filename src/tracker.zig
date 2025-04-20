@@ -52,6 +52,9 @@ pub fn requestPeers(allocator: Allocator, torrent_file: *const torrent.TorrentFi
     } else if (std.mem.eql(u8, uri.scheme, "http") or std.mem.eql(u8, uri.scheme, "https")) {
         std.debug.print("Using HTTP tracker protocol\n", .{});
         return try sendHttpRequest(allocator, tracker_url);
+    } else if (std.mem.eql(u8, uri.scheme, "wss") or std.mem.eql(u8, uri.scheme, "ws")) {
+        std.debug.print("WebSocket tracker protocol not supported yet: {s}\n", .{uri.scheme});
+        return error.UnsupportedTrackerProtocol;
     } else {
         std.debug.print("Unsupported tracker protocol: {s}\n", .{uri.scheme});
         return error.UnsupportedTrackerProtocol;
@@ -75,6 +78,9 @@ pub fn requestPeersWithUrl(allocator: Allocator, tracker_url: []const u8, params
         defer allocator.free(full_url);
 
         return try sendHttpRequest(allocator, full_url);
+    } else if (std.mem.eql(u8, uri.scheme, "wss") or std.mem.eql(u8, uri.scheme, "ws")) {
+        std.debug.print("WebSocket tracker protocol not supported yet: {s}\n", .{uri.scheme});
+        return error.UnsupportedTrackerProtocol;
     } else {
         std.debug.print("Unsupported tracker protocol: {s}\n", .{uri.scheme});
         return error.UnsupportedTrackerProtocol;
@@ -300,7 +306,11 @@ fn parseTrackerResponse(allocator: Allocator, response: []const u8) !Response {
 }
 
 fn buildTrackerUrl(allocator: Allocator, torrent_file: *const torrent.TorrentFile, params: RequestParams) ![]const u8 {
-    return buildTrackerUrlWithAnnounce(allocator, torrent_file.announce_url, params);
+    if (torrent_file.announce_url) |url| {
+        return buildTrackerUrlWithAnnounce(allocator, url, params);
+    } else {
+        return error.NoAnnounceUrl;
+    }
 }
 
 fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, params: RequestParams) ![]const u8 {
@@ -449,7 +459,7 @@ fn sendUdpRequest(allocator: Allocator, uri: std.Uri, params: RequestParams) !Re
 
     std.debug.print("Connecting to UDP tracker: {s}:{}\n", .{ host_str, port });
 
-    // Resolve hostname to IP address
+    // Resolve hostname to IP address with better error handling
     const addr_list = net.getAddressList(allocator, host_str, port) catch |err| {
         std.debug.print("Failed to resolve UDP tracker hostname '{s}': {}\n", .{ host_str, err });
         return error.HostLookupFailed;
@@ -468,9 +478,9 @@ fn sendUdpRequest(allocator: Allocator, uri: std.Uri, params: RequestParams) !Re
     const socket = try posix.socket(address.any.family, posix.SOCK.DGRAM | posix.SOCK.CLOEXEC, 0);
     defer posix.close(socket);
 
-    // Set socket timeout
+    // Set socket timeout - start with a shorter timeout for first attempt
     const timeout = posix.timeval{
-        .tv_sec = 15, // 15 seconds timeout
+        .tv_sec = 5, // 5 seconds initial timeout (reduced from 15)
         .tv_usec = 0,
     };
     posix.setsockopt(
@@ -482,11 +492,27 @@ fn sendUdpRequest(allocator: Allocator, uri: std.Uri, params: RequestParams) !Re
         std.debug.print("Warning: Failed to set socket timeout: {}\n", .{err});
     };
 
+    // Also set send timeout
+    posix.setsockopt(
+        socket,
+        posix.SOL.SOCKET,
+        posix.SO.SNDTIMEO,
+        std.mem.asBytes(&timeout),
+    ) catch |err| {
+        std.debug.print("Warning: Failed to set socket send timeout: {}\n", .{err});
+    };
+
     // Step 1: Connect Packet
-    const connection_id = try sendUdpConnectRequest(socket, address);
+    const connection_id = sendUdpConnectRequest(socket, address) catch |err| {
+        std.debug.print("Failed to connect to UDP tracker: {}\n", .{err});
+        return error.UdpConnectFailed;
+    };
 
     // Step 2: Announce Packet with our parameters
-    return try sendUdpAnnounceRequest(allocator, socket, address, connection_id, params);
+    return sendUdpAnnounceRequest(allocator, socket, address, connection_id, params) catch |err| {
+        std.debug.print("Failed to announce to UDP tracker: {}\n", .{err});
+        return error.UdpAnnounceFailed;
+    };
 }
 
 // UDP protocol constants
@@ -494,7 +520,7 @@ const UDP_CONNECT_ACTION: u32 = 0;
 const UDP_ANNOUNCE_ACTION: u32 = 1;
 const UDP_SCRAPE_ACTION: u32 = 2;
 const UDP_ERROR_ACTION: u32 = 3;
-const UDP_MAGIC: u64 = 0x417271019800;
+const UDP_MAGIC: u64 = 0x41727101980;
 
 fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
     var connect_req = std.mem.zeroes([16]u8);
@@ -509,8 +535,8 @@ fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
 
     // Maximum number of retries
     var retries: u8 = 0;
-    const max_retries = 8;
-    var timeout_seconds: u64 = 15; // Start with 15s timeout
+    const max_retries = 3; // Reduced from 8 to try other trackers more quickly
+    var timeout_seconds: u64 = 5; // Start with 5s timeout (reduced from 15)
 
     while (retries < max_retries) : (retries += 1) {
         // Send connect request
@@ -533,6 +559,9 @@ fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
         var src_addr: posix.sockaddr = undefined;
         var src_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
+        // Add a safety check to ensure we don't overflow the buffer
+        const max_recv_size = response_buf.len;
+
         const received = posix.recvfrom(
             socket,
             &response_buf,
@@ -542,7 +571,8 @@ fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
         ) catch |err| {
             if (err == error.WouldBlock or err == error.ConnectionTimedOut) {
                 std.debug.print("UDP connect timed out, retry {} with timeout {}s\n", .{ retries + 1, timeout_seconds });
-                timeout_seconds *= 2; // Exponential backoff
+                // More gradual backoff
+                timeout_seconds = if (timeout_seconds < 10) 10 else timeout_seconds + 5;
 
                 // Update socket timeout
                 const new_timeout = posix.timeval{
@@ -564,8 +594,8 @@ fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
             return err;
         };
 
-        if (received < 16) {
-            std.debug.print("UDP connect response too short: got {} bytes\n", .{received});
+        if (received < 16 or received > max_recv_size) {
+            std.debug.print("UDP connect response invalid: got {} bytes (expected 16, max {})\n", .{received, max_recv_size});
             if (retries == max_retries - 1) return error.InvalidResponse;
             continue;
         }
@@ -658,8 +688,8 @@ fn sendUdpAnnounceRequest(
 
     // Maximum number of retries
     var retries: u8 = 0;
-    const max_retries = 8;
-    var timeout_seconds: u64 = 15; // Start with 15s timeout
+    const max_retries = 3; // Reduced from 8 to try other trackers more quickly
+    var timeout_seconds: u64 = 5; // Start with 5s timeout (reduced from 15)
 
     while (retries < max_retries) : (retries += 1) {
         // Send announce request
@@ -678,22 +708,24 @@ fn sendUdpAnnounceRequest(
         }
 
         // Receive response - allocate enough space for a response with many peers
-        var response_buf = try allocator.alloc(u8, 16 * 1024);
-        defer allocator.free(response_buf);
+        // Use a fixed-size buffer on the stack for safety
+        var response_buf: [16 * 1024]u8 = undefined;
+        var received_data: []u8 = undefined;
 
         var src_addr: posix.sockaddr = undefined;
         var src_addr_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
         const received = posix.recvfrom(
             socket,
-            response_buf,
+            &response_buf,
             0,
             &src_addr,
             &src_addr_len,
         ) catch |err| {
             if (err == error.WouldBlock or err == error.ConnectionTimedOut) {
                 std.debug.print("UDP announce timed out, retry {} with timeout {}s\n", .{ retries + 1, timeout_seconds });
-                timeout_seconds *= 2; // Exponential backoff
+                // More gradual backoff
+                timeout_seconds = if (timeout_seconds < 10) 10 else timeout_seconds + 5;
 
                 // Update socket timeout
                 const new_timeout = posix.timeval{
@@ -721,9 +753,12 @@ fn sendUdpAnnounceRequest(
             continue;
         }
 
+        // Store the valid received data for processing
+        received_data = response_buf[0..received];
+
         // Validate response
-        const resp_action = std.mem.readInt(u32, response_buf[0..4], .big);
-        const resp_transaction = std.mem.readInt(u32, response_buf[4..8], .big);
+        const resp_action = std.mem.readInt(u32, received_data[0..4], .big);
+        const resp_transaction = std.mem.readInt(u32, received_data[4..8], .big);
 
         if (resp_transaction != transaction_id) {
             std.debug.print("UDP announce transaction ID mismatch\n", .{});
@@ -736,7 +771,7 @@ fn sendUdpAnnounceRequest(
             if (received > 8) {
                 // Instead of using sliceTo, just print the raw error message bytes
                 const max_msg_len = @min(received - 8, 100); // Limit to 100 chars
-                std.debug.print("UDP tracker returned error: {s}\n", .{response_buf[8 .. 8 + max_msg_len]});
+                std.debug.print("UDP tracker returned error: {s}\n", .{received_data[8 .. 8 + max_msg_len]});
             } else {
                 std.debug.print("UDP tracker returned error with no message\n", .{});
             }
@@ -750,17 +785,30 @@ fn sendUdpAnnounceRequest(
         }
 
         // Parse response
-        const interval = std.mem.readInt(u32, response_buf[8..12], .big);
-        const leechers = std.mem.readInt(u32, response_buf[12..16], .big);
-        const seeders = std.mem.readInt(u32, response_buf[16..20], .big);
+        const interval = std.mem.readInt(u32, received_data[8..12], .big);
+        const leechers = std.mem.readInt(u32, received_data[12..16], .big);
+        const seeders = std.mem.readInt(u32, received_data[16..20], .big);
 
         std.debug.print("UDP tracker response: interval={}, leechers={}, seeders={}\n", .{ interval, leechers, seeders });
 
         // Peers data starts at byte 20
-        const peers_data = response_buf[20..received];
+        // Make sure we have enough data for at least one peer (6 bytes per peer)
+        if (received < 26) { // 20 bytes header + at least 6 bytes for one peer
+            std.debug.print("UDP tracker response doesn't contain enough peer data\n", .{});
+            if (retries == max_retries - 1) return error.InvalidResponse;
+            continue;
+        }
+
+        const peers_data = received_data[20..received];
         std.debug.print("Received {} bytes of peer data from UDP tracker\n", .{peers_data.len});
 
-        // Create response
+        // Validate that the peer data length is a multiple of 6 (IPv4 address + port)
+        if (peers_data.len % 6 != 0) {
+            std.debug.print("Warning: UDP tracker returned peer data with length not divisible by 6\n", .{});
+            // We'll continue anyway and just use the valid peers
+        }
+
+        // Create response with a safe copy of the peer data
         return Response{
             .interval = interval,
             .min_interval = null,

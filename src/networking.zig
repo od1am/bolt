@@ -12,6 +12,9 @@ const PieceManager = @import("piece_manager.zig").PieceManager;
 const FileIO = @import("file_io.zig").FileIO;
 const TorrentFile = @import("torrent.zig").TorrentFile;
 const tracker_module = @import("tracker.zig");
+const ThreadPool = @import("thread_pool.zig").ThreadPool;
+const Task = @import("thread_pool.zig").Task;
+const Metrics = @import("metrics.zig").Metrics;
 
 const Protocol = enum {
     tcp,
@@ -27,6 +30,12 @@ pub fn setLocalAddress(address_str: []const u8, port: u16) !void {
     debug.print("Local address set to {}:{}\n", .{ address_str, port });
 }
 
+// PeerContext holds the context for a peer connection task
+pub const PeerContext = struct {
+    peer_manager: *PeerManager,
+    peer: *PeerConnection,
+};
+
 // PeerManager coordinates connections to multiple peers
 pub const PeerManager = struct {
     allocator: Allocator,
@@ -38,6 +47,8 @@ pub const PeerManager = struct {
     info_hash: [20]u8,
     active_peers: std.atomic.Value(usize),
     mutex: std.Thread.Mutex,
+    thread_pool: ?*ThreadPool,
+    metrics: ?*Metrics,
 
     pub fn init(
         allocator: Allocator,
@@ -46,7 +57,22 @@ pub const PeerManager = struct {
         file_io: *FileIO,
         peer_id: [20]u8,
         info_hash: [20]u8,
-    ) PeerManager {
+    ) !PeerManager {
+        // Create a thread pool with a fixed number of threads to avoid any potential issues
+        // Use a conservative number of threads that should work on any system
+        const thread_count: u8 = 4; // Fixed number of threads to avoid any potential issues
+
+        const thread_pool = try allocator.create(ThreadPool);
+        errdefer allocator.destroy(thread_pool);
+
+        thread_pool.* = try ThreadPool.init(allocator, thread_count, 100);
+
+        // Create metrics collector
+        const metrics = try allocator.create(Metrics);
+        errdefer allocator.destroy(metrics);
+
+        metrics.* = Metrics.init(allocator);
+
         return PeerManager{
             .allocator = allocator,
             .torrent_file = torrent_file,
@@ -57,10 +83,55 @@ pub const PeerManager = struct {
             .info_hash = info_hash,
             .active_peers = std.atomic.Value(usize).init(0),
             .mutex = std.Thread.Mutex{},
+            .thread_pool = thread_pool,
+            .metrics = metrics,
+        };
+    }
+
+    // Simplified initialization without thread pool to avoid issues
+    pub fn initSimple(
+        allocator: Allocator,
+        torrent_file: TorrentFile,
+        piece_manager: *PieceManager,
+        file_io: *FileIO,
+        peer_id: [20]u8,
+        info_hash: [20]u8,
+    ) !PeerManager {
+        // Create metrics collector
+        const metrics = try allocator.create(Metrics);
+        errdefer allocator.destroy(metrics);
+
+        metrics.* = Metrics.init(allocator);
+
+        return PeerManager{
+            .allocator = allocator,
+            .torrent_file = torrent_file,
+            .piece_manager = piece_manager,
+            .file_io = file_io,
+            .peers = ArrayList(PeerConnection).init(allocator),
+            .peer_id = peer_id,
+            .info_hash = info_hash,
+            .active_peers = std.atomic.Value(usize).init(0),
+            .mutex = std.Thread.Mutex{},
+            .thread_pool = null,
+            .metrics = metrics,
         };
     }
 
     pub fn deinit(self: *PeerManager) void {
+        // Clean up thread pool
+        if (self.thread_pool) |thread_pool| {
+            thread_pool.deinit();
+            self.allocator.destroy(thread_pool);
+        }
+
+        // Clean up metrics
+        if (self.metrics) |metrics| {
+            metrics.deinit();
+            self.allocator.destroy(metrics);
+        }
+
+        // Clean up peers
         for (self.peers.items) |*peer| {
             peer.deinit();
         }
@@ -68,7 +139,7 @@ pub const PeerManager = struct {
     }
 
     pub fn getActivePeerCount(self: *PeerManager) usize {
-        return self.active_peers.load(.acquire);
+        return self.active_peers.load(.monotonic);
     }
 
     // Connect to a peer and add it to the list
@@ -80,6 +151,11 @@ pub const PeerManager = struct {
         const ip = try std.fmt.bufPrint(&ip_buf, "{}", .{address});
 
         debug.print("Attempting to connect to peer {s}\n", .{ip});
+
+        // Record connection attempt in metrics
+        if (self.metrics) |metrics| {
+            metrics.recordConnectionAttempt();
+        }
 
         // Create a socket with a shorter timeout
         const socket = if (local_address) |local_addr| blk: {
@@ -104,6 +180,16 @@ pub const PeerManager = struct {
                 ) catch |err| {
                     debug.print("Warning: Failed to set socket timeout: {}\n", .{err});
                 };
+
+                // Also set send timeout
+                posix.setsockopt(
+                    sock,
+                    posix.SOL.SOCKET,
+                    posix.SO.SNDTIMEO,
+                    std.mem.asBytes(&timeout),
+                ) catch |err| {
+                    debug.print("Warning: Failed to set socket send timeout: {}\n", .{err});
+                };
             }
 
             // Bind to the local address
@@ -115,11 +201,22 @@ pub const PeerManager = struct {
             break :blk std.net.Stream{ .handle = sock };
         } else std.net.tcpConnectToAddress(address) catch |err| {
             debug.print("Failed to connect to peer {s}: {}\n", .{ ip, err });
+
+            // Record failed connection in metrics
+            if (self.metrics) |metrics| {
+                metrics.recordFailedConnection();
+            }
+
             return err;
         };
         errdefer {
             // Safely close the socket - in Zig 0.13 std.net.Stream.close() also returns void
             socket.close();
+
+            // Record failed connection in metrics
+            if (self.metrics) |metrics| {
+                metrics.recordFailedConnection();
+            }
         }
 
         // For non-blocking socket operations, we'll use a manual timer approach
@@ -147,11 +244,21 @@ pub const PeerManager = struct {
             debug.print("Closing socket after handshake failure\n", .{});
             socket.close();
 
+            // Record failed connection in metrics
+            if (self.metrics) |metrics| {
+                metrics.recordFailedConnection();
+            }
+
             return err;
         };
 
         try self.peers.append(peer);
         debug.print("Successfully connected to peer {s}\n", .{ip});
+
+        // Record successful connection in metrics
+        if (self.metrics) |metrics| {
+            metrics.recordSuccessfulConnection();
+        }
     }
 
     // Start downloading pieces from all connected peers
@@ -161,12 +268,39 @@ pub const PeerManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        for (self.peers.items) |*peer| {
-            debug.print("Sending interested message to peer\n", .{});
+        // Check if we have any peers
+        if (self.peers.items.len == 0) {
+            debug.print("No peers connected, cannot start download\n", .{});
+            return error.NoPeersConnected;
+        }
+
+        // If we have a thread pool, use it
+        if (self.thread_pool != null) {
+            for (self.peers.items) |*peer| {
+                debug.print("Sending interested message to peer\n", .{});
+                try peer.sendMessage(.interested);
+
+                // Create a context for this peer task
+                const context = try self.allocator.create(PeerContext);
+                context.* = PeerContext{
+                    .peer_manager = self,
+                    .peer = peer,
+                };
+
+                // Submit the peer handling task to the thread pool
+                try self.thread_pool.?.submit(Task{
+                    .function = peerTaskFunction,
+                    .context = context,
+                });
+            }
+        } else {
+            // No thread pool, just use the first peer directly
+            debug.print("Using simplified download with first peer\n", .{});
+            var peer = &self.peers.items[0];
             try peer.sendMessage(.interested);
 
-            const thread = try std.Thread.spawn(.{}, handlePeer, .{ self, peer });
-            thread.detach();
+            // Handle the peer directly
+            try handlePeer(self, peer);
         }
     }
 
@@ -183,16 +317,56 @@ pub const PeerManager = struct {
         debug.print("Adding new peer to download process\n", .{});
         try peer.sendMessage(.interested);
 
-        const thread = try std.Thread.spawn(.{}, handlePeer, .{ self, peer });
-        thread.detach();
+        // If we have a thread pool, use it
+        if (self.thread_pool != null) {
+            // Create a context for this peer task
+            const context = try self.allocator.create(PeerContext);
+            context.* = PeerContext{
+                .peer_manager = self,
+                .peer = peer,
+            };
+
+            // Submit the peer handling task to the thread pool
+            try self.thread_pool.?.submit(Task{
+                .function = peerTaskFunction,
+                .context = context,
+            });
+        } else {
+            // No thread pool, just handle the peer directly if we're not already downloading
+            if (self.piece_manager.isDownloadComplete()) {
+                debug.print("Download already complete, not adding new peer\n", .{});
+                return;
+            }
+
+            // Only add the peer if we don't have any active peers
+            if (self.active_peers.load(.monotonic) == 0) {
+                debug.print("No active peers, adding new peer for direct download\n", .{});
+                try handlePeer(self, peer);
+            }
+        }
     }
 
-    // Handle messages from a single peer (runs in a separate thread)
+    // Function that wraps handlePeer for the thread pool
+    fn peerTaskFunction(context_ptr: *anyopaque) void {
+        const context = @as(*PeerContext, @ptrCast(@alignCast(context_ptr)));
+        defer context.peer_manager.allocator.destroy(context);
+
+        handlePeer(context.peer_manager, context.peer) catch |err| {
+            debug.print("Peer task failed: {}\n", .{err});
+        };
+    }
+
+    // Handle messages from a single peer (runs in the thread pool)
     fn handlePeer(self: *PeerManager, peer: *PeerConnection) !void {
-        _ = self.active_peers.fetchAdd(1, .acq_rel);
+        _ = self.active_peers.fetchAdd(1, .monotonic);
         defer {
-            _ = self.active_peers.fetchSub(1, .acq_rel);
-            debug.print("Peer disconnected, active peers: {}\n", .{self.active_peers.load(.acquire)});
+            _ = self.active_peers.fetchSub(1, .monotonic);
+            debug.print("Peer disconnected, active peers: {}\n", .{self.active_peers.load(.monotonic)});
+
+            // Record peer disconnection in metrics
+            if (self.metrics) |metrics| {
+                metrics.recordPeerDisconnection();
+            }
         }
 
         defer peer.deinit();
@@ -204,8 +378,8 @@ pub const PeerManager = struct {
         var current_piece: ?usize = null;
         var last_message_time = std.time.milliTimestamp();
         var last_piece_progress_time = std.time.milliTimestamp();
-        const timeout_ms = 60 * 1000; // 60 seconds timeout for general inactivity
-        const piece_timeout_ms = 30 * 1000; // 30 seconds timeout for piece progress
+        const timeout_ms = 90 * 1000; // 90 seconds timeout for general inactivity (increased from 60)
+        const piece_timeout_ms = 45 * 1000; // 45 seconds timeout for piece progress (increased from 30)
         var consecutive_errors: u8 = 0;
         var blocks_received: usize = 0;
         var last_blocks_received: usize = 0;
@@ -255,9 +429,12 @@ pub const PeerManager = struct {
                 }
             }
 
-            // Set a read timeout on the socket
-            peer.setReadTimeout(5 * 1000) catch |err| {
-                debug.print("Failed to set socket timeout: {}\n", .{err});
+            // Set timeouts on the socket - longer timeout to avoid premature disconnections
+            peer.setReadTimeout(10 * 1000) catch |err| {
+                debug.print("Failed to set socket read timeout: {}\n", .{err});
+            };
+            peer.setWriteTimeout(10 * 1000) catch |err| {
+                debug.print("Failed to set socket write timeout: {}\n", .{err});
             };
 
             var message = peer.readMessage() catch |err| {
@@ -383,6 +560,12 @@ pub const PeerManager = struct {
 
                     try self.file_io.writeBlock(piece.index, piece.begin, piece.block);
                     self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block);
+
+                    // Record downloaded bytes in metrics
+                    if (self.metrics) |metrics| {
+                        metrics.recordBytesDownloaded(piece.block.len);
+                        try metrics.updateDownloadRate();
+                    }
 
                     // If we've completed the current piece, request another one
                     if (current_piece != null and self.piece_manager.hasPiece(current_piece.?)) {
@@ -547,6 +730,13 @@ pub const PeerManager = struct {
             }
         }
         debug.print("Download complete for this peer\n", .{});
+    }
+
+    // Print current metrics
+    pub fn printMetrics(self: *PeerManager) void {
+        if (self.metrics) |metrics| {
+            metrics.printMetrics();
+        }
     }
 };
 

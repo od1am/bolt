@@ -16,7 +16,7 @@ test "parseTorrentFile" {
     defer torrent_file.deinit(allocator);
 
     // Test basic properties
-    try testing.expectEqualStrings("http://tracker.example.com/announce", torrent_file.announce_url);
+    try testing.expectEqualStrings("http://tracker.example.com/announce", torrent_file.announce_url.?);
     try testing.expectEqualStrings("test.txt", torrent_file.info.name);
     try testing.expectEqual(@as(usize, 16384), torrent_file.info.piece_length);
     try testing.expectEqual(@as(usize, 1024), torrent_file.info.length.?);
@@ -36,7 +36,7 @@ test "parseTorrentFile with multiple files" {
     defer torrent_file.deinit(allocator);
 
     // Test basic properties
-    try testing.expectEqualStrings("http://tracker.example.com/announce", torrent_file.announce_url);
+    try testing.expectEqualStrings("http://tracker.example.com/announce", torrent_file.announce_url.?);
     try testing.expectEqualStrings("test_folder", torrent_file.info.name);
     try testing.expectEqual(@as(usize, 16384), torrent_file.info.piece_length);
     try testing.expect(torrent_file.info.length == null);

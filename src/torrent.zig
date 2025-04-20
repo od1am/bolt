@@ -4,12 +4,21 @@ const BencodeValue = @import("bencode.zig").BencodeValue;
 const StringArrayHashMap = std.StringArrayHashMap;
 
 pub const TorrentFile = struct {
-    announce_url: []const u8,
+    announce_url: ?[]const u8 = null,
+    announce_list: ?[][]const u8 = null,
     info: InfoDict,
     info_raw: []const u8,
 
     pub fn deinit(self: *TorrentFile, allocator: Allocator) void {
-        allocator.free(self.announce_url);
+        if (self.announce_url) |url| {
+            allocator.free(url);
+        }
+        if (self.announce_list) |announce_list| {
+            for (announce_list) |url| {
+                allocator.free(url);
+            }
+            allocator.free(announce_list);
+        }
         self.info.deinit(allocator);
         allocator.free(self.info_raw);
     }
@@ -17,7 +26,25 @@ pub const TorrentFile = struct {
     pub fn calculateInfoHash(self: *const TorrentFile) ![20]u8 {
         var hasher = std.crypto.hash.Sha1.init(.{});
         hasher.update(self.info_raw);
-        return hasher.finalResult();
+
+        // Print the raw info dictionary for debugging
+        std.debug.print("Calculating info hash from raw data of length {}\n", .{self.info_raw.len});
+        std.debug.print("First 20 bytes of info_raw: ", .{});
+        for (self.info_raw[0..@min(20, self.info_raw.len)]) |b| {
+            std.debug.print("{x:0>2}", .{b});
+        }
+        std.debug.print("\n", .{});
+
+        const hash = hasher.finalResult();
+
+        // Print the calculated info hash
+        std.debug.print("Calculated info hash: ", .{});
+        for (hash) |b| {
+            std.debug.print("{x:0>2}", .{b});
+        }
+        std.debug.print("\n", .{});
+
+        return hash;
     }
 };
 
@@ -67,13 +94,44 @@ pub fn parseTorrentFile(allocator: Allocator, data: []const u8) !TorrentFile {
 
     if (bencode_value != .dict) return error.InvalidFormat;
 
-    const announce = try extractString(allocator, bencode_value.dict, "announce");
+    // Extract announce URL if present
+    var announce: ?[]const u8 = null;
+    if (bencode_value.dict.get("announce")) |announce_value| {
+        if (announce_value == .string) {
+            announce = try allocator.dupe(u8, announce_value.string);
+        }
+    }
+
     const info_value = bencode_value.dict.get("info") orelse return error.InvalidFormat;
     const info_raw = try serializeBencodeValue(allocator, info_value);
     const info_dict = try extractInfoDict(allocator, info_value);
 
+    // Extract announce-list if present
+    var announce_list: ?[][]const u8 = null;
+    if (bencode_value.dict.get("announce-list")) |announce_list_value| {
+        if (announce_list_value == .list) {
+            var urls = std.ArrayList([]const u8).init(allocator);
+            defer urls.deinit();
+
+            for (announce_list_value.list) |tier| {
+                if (tier == .list) {
+                    for (tier.list) |url_value| {
+                        if (url_value == .string) {
+                            try urls.append(try allocator.dupe(u8, url_value.string));
+                        }
+                    }
+                }
+            }
+
+            if (urls.items.len > 0) {
+                announce_list = try urls.toOwnedSlice();
+            }
+        }
+    }
+
     return TorrentFile{
         .announce_url = announce,
+        .announce_list = announce_list,
         .info = info_dict,
         .info_raw = info_raw,
     };

@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const PeerMessage = @import("peer_wire.zig").PeerMessage;
 const PeerConnection = @import("peer_wire.zig").PeerConnection;
 const FileIO = @import("file_io.zig").FileIO;
+const Metrics = @import("metrics.zig").Metrics;
 
 const Block = struct {
     data: []u8,
@@ -34,6 +35,7 @@ pub const PieceManager = struct {
     in_progress_pieces: std.AutoHashMap(usize, *Piece),
     block_size: u32,
     mutex: std.Thread.Mutex, // Mutex to protect shared data structures
+    metrics: ?*Metrics, // Optional metrics collector
 
     pub fn init(
         allocator: Allocator,
@@ -41,6 +43,7 @@ pub const PieceManager = struct {
         total_pieces: usize,
         piece_hashes: []const [20]u8,
         output_file_path: []const u8,
+        metrics: ?*Metrics,
     ) !PieceManager {
         const bitfield = try allocator.alloc(u8, (total_pieces + 7) / 8);
         @memset(bitfield, 0);
@@ -63,6 +66,7 @@ pub const PieceManager = struct {
             .in_progress_pieces = std.AutoHashMap(usize, *Piece).init(allocator),
             .block_size = 16 * 1024, // 16KB blocks
             .mutex = std.Thread.Mutex{},
+            .metrics = metrics,
         };
     }
 
@@ -86,17 +90,26 @@ pub const PieceManager = struct {
     }
 
     pub fn hasPiece(self: *PieceManager, piece_index: usize) bool {
+        // This is a read-only operation on the bitfield, which is only modified in markPieceComplete
+        // We don't need to lock the mutex for this operation since it's atomic
         const byte_index = piece_index / 8;
         const bit_index: u3 = @intCast(piece_index % 8);
         return (self.bitfield[byte_index] & (@as(u8, 1) << bit_index)) != 0;
     }
 
     pub fn markPieceComplete(self: *PieceManager, piece_index: usize) void {
+        // This function is only called from processPiece, which already has the mutex locked
         const byte_index = piece_index / 8;
         const bit_index: u3 = @intCast(piece_index % 8);
         self.bitfield[byte_index] |= (@as(u8, 1) << bit_index);
         self.downloaded_pieces += 1;
         std.debug.print("Piece {} complete! ({}/{} pieces)\n", .{ piece_index, self.downloaded_pieces, self.total_pieces });
+
+        // Update metrics
+        if (self.metrics) |metrics| {
+            metrics.recordPieceDownloaded();
+            metrics.recordPieceVerified();
+        }
     }
 
     pub fn verifyPiece(self: *PieceManager, piece_index: usize, piece_data: []const u8) bool {
@@ -368,6 +381,11 @@ pub const PieceManager = struct {
         } else {
             std.debug.print("Piece {} verification failed, will re-download\n", .{piece.index});
 
+            // Update metrics for failed piece
+            if (self.metrics) |metrics| {
+                metrics.recordPieceFailed();
+            }
+
             // Reset the piece to try again
             for (piece.blocks) |*block| {
                 if (block.received) {
@@ -384,6 +402,8 @@ pub const PieceManager = struct {
     }
 
     pub fn isDownloadComplete(self: *PieceManager) bool {
+        // This is a simple comparison that doesn't need a mutex lock
+        // The downloaded_pieces is only modified in markPieceComplete which is protected
         const complete = self.downloaded_pieces == self.total_pieces;
         if (complete) {
             std.debug.print("Download is complete! ({}/{} pieces)\n", .{ self.downloaded_pieces, self.total_pieces });
@@ -392,6 +412,10 @@ pub const PieceManager = struct {
     }
 
     pub fn getNextNeededPiece(self: *PieceManager) ?usize {
+        // Lock the mutex to ensure consistent state while selecting a piece
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         // First, try to find a piece that isn't in progress and hasn't been downloaded
         var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
         const random = rng.random();
@@ -483,5 +507,10 @@ pub const PieceManager = struct {
     // Add method to set FileIO reference
     pub fn setFileIO(self: *PieceManager, file_io: *FileIO) void {
         self.file_io = file_io;
+    }
+
+    // Set metrics collector
+    pub fn setMetrics(self: *PieceManager, metrics: *Metrics) void {
+        self.metrics = metrics;
     }
 };
