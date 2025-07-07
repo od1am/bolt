@@ -16,14 +16,14 @@ pub const Event = enum {
 pub const RequestParams = struct {
     info_hash: [20]u8,
     peer_id: [20]u8,
+    ip: ?[]const u8 = null,
     port: u16,
-    uploaded: u64,
-    downloaded: u64,
+    amount_uploaded: u64,
+    amount_downloaded: u64,
     left: u64,
     compact: bool = true,
     no_peer_id: bool = false,
     event: Event = .none,
-    ip: ?[]const u8 = null,
     numwant: ?u32 = null,
     key: ?[]const u8 = null,
     trackerid: ?[]const u8 = null,
@@ -351,8 +351,8 @@ fn buildTrackerUrlWithAnnounce(allocator: Allocator, announce: []const u8, param
     try query_parts.append(try std.fmt.allocPrint(allocator, "info_hash={s}", .{encoded_info_hash[0..info_hash_len]}));
     try query_parts.append(try std.fmt.allocPrint(allocator, "peer_id={s}", .{encoded_peer_id[0..peer_id_len]}));
     try query_parts.append(try std.fmt.allocPrint(allocator, "port={d}", .{params.port}));
-    try query_parts.append(try std.fmt.allocPrint(allocator, "uploaded={d}", .{params.uploaded}));
-    try query_parts.append(try std.fmt.allocPrint(allocator, "downloaded={d}", .{params.downloaded}));
+    try query_parts.append(try std.fmt.allocPrint(allocator, "uploaded={d}", .{params.amount_uploaded}));
+    try query_parts.append(try std.fmt.allocPrint(allocator, "downloaded={d}", .{params.amount_downloaded}));
     try query_parts.append(try std.fmt.allocPrint(allocator, "left={d}", .{params.left}));
     try query_parts.append(try std.fmt.allocPrint(allocator, "compact={d}", .{@as(u8, if (params.compact) 1 else 0)}));
 
@@ -480,8 +480,8 @@ fn sendUdpRequest(allocator: Allocator, uri: std.Uri, params: RequestParams) !Re
 
     // Set socket timeout - start with a shorter timeout for first attempt
     const timeout = posix.timeval{
-        .tv_sec = 5, // 5 seconds initial timeout (reduced from 15)
-        .tv_usec = 0,
+        .sec = 5, // 5 seconds initial timeout (reduced from 15)
+        .usec = 0,
     };
     posix.setsockopt(
         socket,
@@ -576,8 +576,8 @@ fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
 
                 // Update socket timeout
                 const new_timeout = posix.timeval{
-                    .tv_sec = @intCast(timeout_seconds),
-                    .tv_usec = 0,
+                    .sec = @intCast(timeout_seconds),
+                    .usec = 0,
                 };
 
                 posix.setsockopt(
@@ -595,7 +595,7 @@ fn sendUdpConnectRequest(socket: posix.socket_t, address: net.Address) !u64 {
         };
 
         if (received < 16 or received > max_recv_size) {
-            std.debug.print("UDP connect response invalid: got {} bytes (expected 16, max {})\n", .{received, max_recv_size});
+            std.debug.print("UDP connect response invalid: got {} bytes (expected 16, max {})\n", .{ received, max_recv_size });
             if (retries == max_retries - 1) return error.InvalidResponse;
             continue;
         }
@@ -656,13 +656,13 @@ fn sendUdpAnnounceRequest(
     @memcpy(announce_req[36..56], &params.peer_id);
 
     // Downloaded (8 bytes)
-    std.mem.writeInt(u64, announce_req[56..64], params.downloaded, .big);
+    std.mem.writeInt(u64, announce_req[56..64], params.amount_downloaded, .big);
 
     // Left (8 bytes)
     std.mem.writeInt(u64, announce_req[64..72], params.left, .big);
 
     // Uploaded (8 bytes)
-    std.mem.writeInt(u64, announce_req[72..80], params.uploaded, .big);
+    std.mem.writeInt(u64, announce_req[72..80], params.amount_uploaded, .big);
 
     // Event (4 bytes)
     const event: u32 = switch (params.event) {
@@ -729,8 +729,8 @@ fn sendUdpAnnounceRequest(
 
                 // Update socket timeout
                 const new_timeout = posix.timeval{
-                    .tv_sec = @intCast(timeout_seconds),
-                    .tv_usec = 0,
+                    .sec = @intCast(timeout_seconds),
+                    .usec = 0,
                 };
 
                 posix.setsockopt(

@@ -145,17 +145,17 @@ pub const ThreadPool = struct {
             // Check if there are tasks in the queue
             if (pool.task_queue.readableLength() > 0) {
                 // First peek at the task
-                if (peekItem(&pool.task_queue)) |t| {
+                if (peekItem(&pool.task_queue)) |_| {
                     // We found a task, now try to remove it from the queue
-                    _ = pool.task_queue.readItem() catch {
+                    if (pool.task_queue.readItem()) |item| {
+                        // Successfully got the task
+                        task = item;
+                        got_task = true;
+                    } else {
                         // If we can't read the item, just continue
                         pool.queue_mutex.unlock();
                         continue;
-                    };
-
-                    // Successfully got the task
-                    task = t;
-                    got_task = true;
+                    }
                 }
             }
 
@@ -184,4 +184,100 @@ pub const ThreadPool = struct {
     }
 };
 
+const testing = std.testing;
+var test_counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
 
+fn testTaskFunction(context: *anyopaque) void {
+    const value = @as(*u32, @ptrCast(@alignCast(context)));
+    _ = test_counter.fetchAdd(value.*, .monotonic);
+}
+
+test "thread pool basic functionality" {
+    const allocator = testing.allocator;
+
+    var pool = try ThreadPool.init(allocator, 2, 10);
+    defer pool.deinit();
+
+    // Reset counter
+    test_counter.store(0, .monotonic);
+
+    // Submit some tasks
+    var values = [_]u32{ 1, 2, 3, 4, 5 };
+    for (&values) |*value| {
+        const task = Task{
+            .function = testTaskFunction,
+            .context = value,
+        };
+        try pool.submit(task);
+    }
+
+    // Wait for tasks to complete
+    while (pool.getActiveTaskCount() > 0 or pool.getQueuedTaskCount() > 0) {
+        std.time.sleep(10 * std.time.ns_per_ms);
+    }
+
+    // Check that all tasks were executed
+    const final_count = test_counter.load(.monotonic);
+    try testing.expectEqual(@as(usize, 15), final_count); // 1+2+3+4+5 = 15
+}
+
+test "thread pool queue limits" {
+    const allocator = testing.allocator;
+
+    var pool = try ThreadPool.init(allocator, 1, 2); // Small queue
+    defer pool.deinit();
+
+    var values = [_]u32{ 1, 1, 1, 1, 1 };
+    var submitted: usize = 0;
+
+    // Try to submit more tasks than queue can hold
+    for (&values) |*value| {
+        const task = Task{
+            .function = testTaskFunction,
+            .context = value,
+        };
+
+        if (pool.submit(task)) {
+            submitted += 1;
+        } else |err| {
+            if (err == error.QueueFull) {
+                break;
+            }
+            return err;
+        }
+    }
+
+    // Should have submitted some tasks but not all due to queue limit
+    try testing.expect(submitted <= 3); // 1 active + 2 queued max
+}
+
+test "thread pool shutdown" {
+    const allocator = testing.allocator;
+
+    var pool = try ThreadPool.init(allocator, 2, 10);
+
+    // Submit a task
+    var value: u32 = 42;
+    const task = Task{
+        .function = testTaskFunction,
+        .context = &value,
+    };
+    try pool.submit(task);
+
+    // Shutdown should work without hanging
+    pool.deinit();
+
+    // After shutdown, submitting should fail
+    var pool2 = try ThreadPool.init(allocator, 1, 5);
+    defer pool2.deinit();
+
+    // Manually trigger shutdown
+    _ = pool2.shutdown.swap(true, .monotonic);
+
+    const task2 = Task{
+        .function = testTaskFunction,
+        .context = &value,
+    };
+
+    try testing.expectError(error.ThreadPoolShuttingDown, pool2.submit(task2));
+}

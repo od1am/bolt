@@ -132,8 +132,13 @@ fn parseDict(allocator: Allocator, input: []const u8, pos: *usize) BencodeParseE
         const key_copy = try allocator.dupe(u8, key);
         errdefer allocator.free(key_copy);
 
+        // Note: BitTorrent spec requires sorted keys, but many trackers don't follow this
+        // We'll be lenient and allow unsorted keys for better compatibility
         if (prev_key) |pk| {
-            if (std.mem.order(u8, pk, key_copy) != .lt) return error.KeysNotSorted;
+            if (std.mem.order(u8, pk, key_copy) != .lt) {
+                // Log warning but don't fail
+                std.debug.print("Warning: Bencode dictionary keys not sorted (key: '{s}')\n", .{key_copy});
+            }
         }
 
         try dict.put(key_copy, value);
@@ -267,7 +272,6 @@ test "nested structures" {
 test "serialize and parse" {
     const allocator = std.testing.allocator;
 
-    // Test with a simpler structure to avoid memory leaks
     const value1 = BencodeValue{ .integer = 1337 };
     const serialized1 = try serialize(allocator, value1);
     defer allocator.free(serialized1);
@@ -278,7 +282,6 @@ test "serialize and parse" {
     try std.testing.expect(parsed1 == .integer);
     try std.testing.expectEqual(parsed1.integer, 1337);
 
-    // Test with a string value - storing in var since we need to deinit
     var value2 = BencodeValue{ .string = try allocator.dupe(u8, "test string") };
     defer value2.deinit(allocator);
 
@@ -291,7 +294,6 @@ test "serialize and parse" {
     try std.testing.expect(parsed2 == .string);
     try std.testing.expectEqualStrings(parsed2.string, "test string");
 
-    // Test with a list value
     var list = try allocator.alloc(BencodeValue, 2);
     list[0] = BencodeValue{ .integer = 1 };
     list[1] = BencodeValue{ .integer = 2 };

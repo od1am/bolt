@@ -17,16 +17,16 @@ pub const MessageType = enum(u8) {
 };
 
 pub const PeerMessage = union(enum) {
-    choke: void,
-    unchoke: void,
-    interested: void,
-    not_interested: void,
-    have: u32,
-    bitfield: []const u8,
-    request: struct { index: u32, begin: u32, length: u32 },
-    piece: struct { index: u32, begin: u32, block: []const u8 },
-    cancel: struct { index: u32, begin: u32, length: u32 },
-    keep_alive: void,
+    choke: void, // 0
+    unchoke: void, // 1
+    interested: void, // 2
+    not_interested: void, // 3
+    have: u32, // 4
+    bitfield: []const u8, // 5
+    request: struct { index: u32, begin: u32, length: u32 }, // 6
+    piece: struct { index: u32, begin: u32, block: []const u8 }, // 7
+    cancel: struct { index: u32, begin: u32, length: u32 }, // 8
+    keep_alive: void, //
 
     pub fn deinit(self: *PeerMessage, allocator: Allocator) void {
         switch (self.*) {
@@ -42,10 +42,13 @@ pub const PeerConnection = struct {
     peer_id: [20]u8,
     info_hash: [20]u8,
     allocator: Allocator,
+    closed: bool = false, // track if socket already closed
 
     pub fn deinit(self: *PeerConnection) void {
+        if (self.closed) return; // already closed
         // Close the socket and ignore any errors that might occur
         self.socket.close();
+        self.closed = true;
     }
 
     pub fn setReadTimeout(self: *PeerConnection, milliseconds: u32) !void {
@@ -130,8 +133,15 @@ pub const PeerConnection = struct {
 
     pub fn readMessage(self: *PeerConnection) !PeerMessage {
         var length_buf: [4]u8 = undefined;
-        const bytes_read = try self.socket.read(&length_buf);
-        if (bytes_read != 4) return error.ConnectionClosed;
+        // Read exactly 4 bytes that represent the length prefix. `read` can return fewer
+        // bytes than requested, so loop until we have the full 4-byte prefix (or the
+        // connection closes).
+        var read_so_far: usize = 0;
+        while (read_so_far < 4) {
+            const n = try self.socket.read(length_buf[read_so_far..]);
+            if (n == 0) return error.ConnectionClosed; // peer closed connection prematurely
+            read_so_far += n;
+        }
 
         const length = std.mem.readInt(u32, &length_buf, .big);
         if (length == 0) return .keep_alive;

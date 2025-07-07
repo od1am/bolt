@@ -511,7 +511,7 @@ pub const PeerManager = struct {
 
                         if (peer_has_pieces.items.len > 0) {
                             // Use a random selection from the peer's pieces for better distribution
-                            var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+                            var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
                             const random = rng.random();
 
                             const tries = @min(10, peer_has_pieces.items.len); // Try up to 10 random pieces
@@ -579,7 +579,7 @@ pub const PeerManager = struct {
                         // Try to find a piece this peer has that we need
                         var found_piece = false;
                         if (peer_has_pieces.items.len > 0) {
-                            var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+                            var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
                             const random = rng.random();
 
                             const tries = @min(10, peer_has_pieces.items.len);

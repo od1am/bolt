@@ -17,7 +17,12 @@ pub fn main() !void {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var conf = try cli.parseArgs(allocator);
+    var conf = cli.parseArgs(allocator) catch |err| {
+        if (err == error.HelpRequested or err == error.InvalidArguments) {
+            return;
+        }
+        return err;
+    };
     defer conf.deinit(allocator);
 
     const data = try std.fs.cwd().readFileAlloc(allocator, conf.torrent_path, std.math.maxInt(usize));
@@ -35,7 +40,7 @@ pub fn main() !void {
     if (torrent_file.announce_list) |announce_list| {
         std.debug.print("Found {} alternate trackers:\n", .{announce_list.len});
         for (announce_list, 0..) |url, i| {
-            std.debug.print("  {}: {s}\n", .{i, url});
+            std.debug.print("  {}: {s}\n", .{ i, url });
         }
     } else {
         std.debug.print("No alternate trackers found\n", .{});
@@ -67,10 +72,17 @@ pub fn main() !void {
     var metrics = Metrics.init(allocator);
     defer metrics.deinit();
 
+    const total_size = if (torrent_file.info.length) |len| len else blk: {
+        var sum: usize = 0;
+        for (files) |file| sum += file.length;
+        break :blk sum;
+    };
+
     var piece_manager = try PieceManager.init(
         allocator,
         torrent_file.info.piece_length,
         torrent_file.info.pieces.len / 20,
+        total_size,
         try parsePieceHashes(allocator, torrent_file.info.pieces),
         output_file_path orelse "temp_data", // Use a placeholder if multi-file
         &metrics,
@@ -93,19 +105,13 @@ pub fn main() !void {
     defer peer_manager.deinit();
 
     std.debug.print("Requesting peers from tracker...\n", .{});
-    const total_size = if (torrent_file.info.length) |len| len else blk: {
-        var sum: usize = 0;
-        for (files) |file| {
-            sum += file.length;
-        }
-        break :blk sum;
-    };
+
     const params = tracker.RequestParams{
         .info_hash = info_hash,
         .peer_id = conf.peer_id,
         .port = conf.listen_port,
-        .uploaded = 0,
-        .downloaded = 0,
+        .amount_uploaded = 0,
+        .amount_downloaded = 0,
         .left = total_size,
         .compact = true,
     };
@@ -115,63 +121,63 @@ pub fn main() !void {
 
     tracker_connect: {
 
-    // Add default trackers if none are found
-    var default_trackers = std.ArrayList([]const u8).init(allocator);
-    defer default_trackers.deinit();
+        // Add default trackers if none are found
+        var default_trackers = std.ArrayList([]const u8).init(allocator);
+        defer default_trackers.deinit();
 
-    if (torrent_file.announce_url == null and (torrent_file.announce_list == null or torrent_file.announce_list.?.len == 0)) {
-        std.debug.print("No trackers found in torrent file, adding default trackers\n", .{});
+        if (torrent_file.announce_url == null and (torrent_file.announce_list == null or torrent_file.announce_list.?.len == 0)) {
+            std.debug.print("No trackers found in torrent file, adding default trackers\n", .{});
 
-        // Add some default trackers - prioritize more reliable ones
-        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.opentrackr.org:1337"));
-        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.openbittorrent.com:80"));
-        try default_trackers.append(try allocator.dupe(u8, "udp://exodus.desync.com:6969"));
-        try default_trackers.append(try allocator.dupe(u8, "udp://open.stealth.si:80"));
-        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.coppersurfer.tk:6969"));
-        try default_trackers.append(try allocator.dupe(u8, "udp://tracker.leechers-paradise.org:6969"));
+            // Add some default trackers - prioritize more reliable ones
+            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.opentrackr.org:1337"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.openbittorrent.com:80"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://exodus.desync.com:6969"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://open.stealth.si:80"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.coppersurfer.tk:6969"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.leechers-paradise.org:6969"));
 
-        // Set as announce list
-        torrent_file.announce_list = try default_trackers.toOwnedSlice();
-    }
-
-    // Try to connect to the main tracker if available
-    if (torrent_file.announce_url) |announce_url| {
-        std.debug.print("Trying primary tracker: {s}...\n", .{announce_url});
-        if (tracker.requestPeersWithUrl(allocator, announce_url, params, "")) |response| {
-            tracker_response = response;
-            std.debug.print("Successfully connected to primary tracker, starting download...\n", .{});
-            // We have a successful tracker response, proceed with download
-            break :tracker_connect;
-        } else |err| {
-            std.debug.print("Failed to connect to primary tracker: {}\n", .{err});
-            // Just continue with null tracker_response
+            // Set as announce list
+            torrent_file.announce_list = try default_trackers.toOwnedSlice();
         }
-    }
 
-    // If primary tracker failed or doesn't exist, try alternate trackers
-    if (tracker_response == null and torrent_file.announce_list != null and torrent_file.announce_list.?.len > 0) {
-        std.debug.print("Trying alternate trackers...\n", .{});
-
-        for (torrent_file.announce_list.?) |announce_url| {
-            std.debug.print("Trying tracker: {s}\n", .{announce_url});
-
+        // Try to connect to the main tracker if available
+        if (torrent_file.announce_url) |announce_url| {
+            std.debug.print("Trying primary tracker: {s}...\n", .{announce_url});
             if (tracker.requestPeersWithUrl(allocator, announce_url, params, "")) |response| {
                 tracker_response = response;
-                std.debug.print("Successfully connected to alternate tracker, starting download...\n", .{});
+                std.debug.print("Successfully connected to primary tracker, starting download...\n", .{});
                 // We have a successful tracker response, proceed with download
                 break :tracker_connect;
-            } else |alt_err| {
-                std.debug.print("Failed to connect to alternate tracker: {}\n", .{alt_err});
-                continue;
+            } else |err| {
+                std.debug.print("Failed to connect to primary tracker: {}\n", .{err});
+                // Just continue with null tracker_response
             }
         }
-    }
 
-    // If all trackers failed, return error
-    if (tracker_response == null) {
-        std.debug.print("Failed to connect to any trackers\n", .{});
-        return error.AllTrackersConnectionFailed;
-    }
+        // If primary tracker failed or doesn't exist, try alternate trackers
+        if (tracker_response == null and torrent_file.announce_list != null and torrent_file.announce_list.?.len > 0) {
+            std.debug.print("Trying alternate trackers...\n", .{});
+
+            for (torrent_file.announce_list.?) |announce_url| {
+                std.debug.print("Trying tracker: {s}\n", .{announce_url});
+
+                if (tracker.requestPeersWithUrl(allocator, announce_url, params, "")) |response| {
+                    tracker_response = response;
+                    std.debug.print("Successfully connected to alternate tracker, starting download...\n", .{});
+                    // We have a successful tracker response, proceed with download
+                    break :tracker_connect;
+                } else |alt_err| {
+                    std.debug.print("Failed to connect to alternate tracker: {}\n", .{alt_err});
+                    continue;
+                }
+            }
+        }
+
+        // If all trackers failed, return error
+        if (tracker_response == null) {
+            std.debug.print("Failed to connect to any trackers\n", .{});
+            return error.AllTrackersConnectionFailed;
+        }
     } // End of tracker_connect block
 
     defer allocator.free(tracker_response.?.peers);
@@ -193,7 +199,7 @@ pub fn main() !void {
     for (peers, 0..) |peer_addr, i| {
         if (i >= max_initial_connections) break; // Limit initial connection attempts
 
-        std.debug.print("Connecting to peer {} ({}/{})\n", .{peer_addr, i+1, @min(peers.len, max_initial_connections)});
+        std.debug.print("Connecting to peer {} ({}/{})\n", .{ peer_addr, i + 1, @min(peers.len, max_initial_connections) });
         peer_manager.connectToPeer(peer_addr) catch |err| {
             std.debug.print("Failed to connect to peer: {}\n", .{err});
             continue;
@@ -251,7 +257,7 @@ pub fn main() !void {
     const max_connections_limit: usize = 30; // Hard limit to avoid too many connections
 
     // Create a random number generator for better peer selection
-    var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
     const random = rng.random();
 
     while (!piece_manager.isDownloadComplete()) {
@@ -265,8 +271,8 @@ pub fn main() !void {
                 .info_hash = info_hash,
                 .peer_id = conf.peer_id,
                 .port = conf.listen_port,
-                .uploaded = 0,
-                .downloaded = piece_manager.downloaded_pieces * piece_manager.piece_length,
+                .amount_uploaded = 0,
+                .amount_downloaded = piece_manager.downloaded_pieces * piece_manager.piece_length,
                 .left = total_size - (piece_manager.downloaded_pieces * piece_manager.piece_length),
                 .compact = true,
             };

@@ -27,6 +27,7 @@ pub const PieceManager = struct {
     allocator: Allocator,
     piece_length: usize,
     total_pieces: usize,
+    total_length: usize,
     piece_hashes: []const [20]u8,
     bitfield: []u8,
     downloaded_pieces: usize,
@@ -41,6 +42,7 @@ pub const PieceManager = struct {
         allocator: Allocator,
         piece_length: usize,
         total_pieces: usize,
+        total_length: usize,
         piece_hashes: []const [20]u8,
         output_file_path: []const u8,
         metrics: ?*Metrics,
@@ -58,6 +60,7 @@ pub const PieceManager = struct {
             .allocator = allocator,
             .piece_length = piece_length,
             .total_pieces = total_pieces,
+            .total_length = total_length,
             .piece_hashes = piece_hashes,
             .bitfield = bitfield,
             .downloaded_pieces = 0,
@@ -171,9 +174,8 @@ pub const PieceManager = struct {
         }
 
         const piece_size = if (piece_index == self.total_pieces - 1) blk: {
-            const total_size = self.piece_length * self.total_pieces;
-            const remaining = total_size - (piece_index * self.piece_length);
-            break :blk @as(u32, @min(@as(u32, @intCast(remaining)), @as(u32, @intCast(self.piece_length))));
+            const remaining = self.total_length - (piece_index * self.piece_length);
+            break :blk @as(u32, @intCast(remaining));
         } else @as(u32, @intCast(self.piece_length));
 
         std.debug.print("DOWNLOAD STARTED: Requesting piece {} (size: {})\n", .{ piece_index, piece_size });
@@ -417,7 +419,7 @@ pub const PieceManager = struct {
         defer self.mutex.unlock();
 
         // First, try to find a piece that isn't in progress and hasn't been downloaded
-        var rng = std.rand.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+        var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
         const random = rng.random();
 
         // Collect all available pieces

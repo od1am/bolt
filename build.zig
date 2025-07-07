@@ -1,13 +1,26 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
     const exe = b.addExecutable(.{
         .name = "bolt",
         .root_source_file = b.path("src/main.zig"),
-        .target = b.host,
+        .target = target,
+        .optimize = optimize,
     });
 
     b.installArtifact(exe);
+
+    // Add a run step
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+    const run_step = b.step("run", "Run the application");
+    run_step.dependOn(&run_cmd.step);
 
     // Add a test step
     const test_step = b.step("test", "Run all tests");
@@ -15,7 +28,8 @@ pub fn build(b: *std.Build) void {
     // Create a test executable
     const tests = b.addTest(.{
         .root_source_file = b.path("src/tests.zig"),
-        .target = b.host,
+        .target = target,
+        .optimize = optimize,
     });
 
     // Create a command to run the tests
