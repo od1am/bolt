@@ -3,8 +3,8 @@ const Allocator = std.mem.Allocator;
 const torrent = @import("torrent.zig");
 const bencode = @import("bencode.zig");
 const StringArrayHashMap = std.StringArrayHashMap;
-const net = @import("std").net;
-const posix = @import("std").posix;
+const net = std.net;
+const posix = std.posix;
 
 pub const Event = enum {
     none,

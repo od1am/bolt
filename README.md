@@ -4,35 +4,20 @@ A BitTorrent client written in Zig, featuring support for both HTTP and UDP trac
 
 ## Features
 
-- ✅ Bencode parsing and serialization
-- ✅ Torrent file parsing (single and multi-file)
-- ✅ HTTP and UDP tracker support
-- ✅ BitTorrent peer wire protocol
-- ✅ Piece verification with SHA-1 hashing
-- ✅ Concurrent downloads from multiple peers
-- ✅ Thread pool for peer management
-- ✅ Download progress tracking and metrics
-- ✅ Automatic peer discovery and connection management
+- Bencode parsing and serialization
+- Torrent file parsing (single and multi-file)
+- HTTP and UDP tracker support
+- BitTorrent peer wire protocol
+- Piece verification with SHA-1 hashing
+- Concurrent downloads from multiple peers
+- Thread pool for peer management
+- Download progress tracking and metrics
+- Automatic peer discovery and connection management
 
 ## Building
 
-### Using Nix (Recommended)
-
-```bash
-# Build the project
-nix build
-
-# Enter development shell
-nix develop
-
-# Run directly
-nix run . -- <torrent_file> [options]
-```
-
-### Using Zig directly
-
 Requirements:
-- Zig 0.13.0 or later
+- Zig 0.14.0 or later
 
 ```bash
 # Build
@@ -80,25 +65,6 @@ zig build test
 
 ## Development
 
-### Project Structure
-
-```
-src/
-├── main.zig           # Main application entry point
-├── bencode.zig        # Bencode parsing/serialization
-├── torrent.zig        # Torrent file parsing
-├── tracker.zig        # Tracker communication (HTTP/UDP)
-├── networking.zig     # Peer connection management
-├── peer_wire.zig      # BitTorrent protocol implementation
-├── piece_manager.zig  # Piece download and verification
-├── file_io.zig        # File writing operations
-├── thread_pool.zig    # Thread pool implementation
-├── metrics.zig        # Download metrics and statistics
-├── config.zig         # Configuration management
-├── cli.zig           # Command line argument parsing
-└── tests.zig         # Test suite
-```
-
 ### Running Tests
 
 ```bash
@@ -107,17 +73,6 @@ zig build test
 
 # Run specific test file
 zig test src/bencode.zig
-```
-
-### Development with Nix
-
-The flake provides a development environment with:
-- Zig compiler and language server (ZLS)
-- Debugging tools (GDB, Valgrind)
-- All necessary dependencies
-
-```bash
-nix develop
 ```
 
 ## Protocol Support
