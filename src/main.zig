@@ -195,13 +195,19 @@ pub fn main() !void {
 
     std.debug.print("Attempting to connect to peers...\n", .{});
 
-    // Try to connect to peers
-    for (peers, 0..) |peer_addr, i| {
-        if (i >= max_initial_connections) break; // Limit initial connection attempts
+    // Try to connect to peers with retry logic
+    var connection_attempts: usize = 0;
+    const max_connection_attempts = @min(peers.len, 50); // Don't try too many peers
 
-        std.debug.print("Connecting to peer {} ({}/{})\n", .{ peer_addr, i + 1, @min(peers.len, max_initial_connections) });
+    while (successful_connections < 3 and connection_attempts < max_connection_attempts) {
+        const peer_index = connection_attempts % peers.len;
+        const peer_addr = peers[peer_index];
+
+        std.debug.print("Connecting to peer {} ({}/{})\n", .{ peer_addr, connection_attempts + 1, max_connection_attempts });
+
         peer_manager.connectToPeer(peer_addr) catch |err| {
             std.debug.print("Failed to connect to peer: {}\n", .{err});
+            connection_attempts += 1;
             continue;
         };
 
@@ -209,21 +215,25 @@ pub fn main() !void {
         std.debug.print("Successfully connected to {} peers so far\n", .{successful_connections});
 
         // Start the download as soon as we connect to the first successful peer
-        // This implements the requirement to start downloading after connecting to the first successful tracker
-        if (successful_connections == 1) {
+        if (successful_connections == 1 and !started_download) {
             std.debug.print("Starting download with first successful peer\n", .{});
-            try peer_manager.startDownload();
+            peer_manager.startDownload() catch |err| {
+                std.debug.print("Failed to start download with first peer: {}\n", .{err});
+                // Continue trying with more peers instead of giving up
+                connection_attempts += 1;
+                continue;
+            };
             started_download = true;
         }
 
-        // If we have at least 2 successful connections, we can stop connecting to more peers initially
-        if (successful_connections >= 2) {
-            break;
-        }
+        connection_attempts += 1;
+
+        // Small delay between connection attempts to avoid overwhelming peers
+        std.time.sleep(100 * std.time.ns_per_ms);
     }
 
     if (successful_connections == 0) {
-        std.debug.print("Failed to connect to any peers, exiting\n", .{});
+        std.debug.print("Failed to connect to any peers after {} attempts, exiting\n", .{connection_attempts});
         return;
     }
 
@@ -232,7 +242,28 @@ pub fn main() !void {
     // If we haven't started the download yet (which is unlikely), start it now
     if (!started_download) {
         std.debug.print("Starting download now\n", .{});
-        try peer_manager.startDownload();
+        peer_manager.startDownload() catch |err| {
+            std.debug.print("Failed to start download: {}\n", .{err});
+            // Try to connect to more peers and retry
+            if (successful_connections < peers.len) {
+                std.debug.print("Attempting to connect to more peers...\n", .{});
+                const retry_start = @min(max_initial_connections, successful_connections + 1);
+                const retry_end = @min(peers.len, retry_start + 10);
+
+                for (peers[retry_start..retry_end]) |peer_addr| {
+                    peer_manager.connectToPeer(peer_addr) catch continue;
+                    successful_connections += 1;
+                }
+
+                // Try to start download again
+                peer_manager.startDownload() catch |retry_err| {
+                    std.debug.print("Failed to start download after retry: {}\n", .{retry_err});
+                    return;
+                };
+            } else {
+                return;
+            }
+        };
         started_download = true;
     }
 
@@ -260,8 +291,51 @@ pub fn main() !void {
     var rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
     const random = rng.random();
 
+    // Download retry logic
+    var download_retry_count: usize = 0;
+    const max_download_retries = 3;
+    var last_successful_download_time = std.time.milliTimestamp();
+    const download_stall_timeout = 120 * 1000; // 2 minutes without progress
+
     while (!piece_manager.isDownloadComplete()) {
         const current_time = std.time.milliTimestamp();
+
+        // Check for download stall and retry if necessary
+        if (current_time - last_successful_download_time > download_stall_timeout) {
+            download_retry_count += 1;
+            std.debug.print("Download appears stalled, attempting retry {}/{}\n", .{ download_retry_count, max_download_retries });
+
+            if (download_retry_count <= max_download_retries) {
+                // Try to connect to more peers
+                const remaining_peers = peers.len - connect_index;
+                if (remaining_peers > 0) {
+                    const retry_count = @min(remaining_peers, 5);
+                    std.debug.print("Connecting to {} additional peers for retry\n", .{retry_count});
+
+                    for (peers[connect_index .. connect_index + retry_count]) |peer_addr| {
+                        peer_manager.connectToPeer(peer_addr) catch continue;
+                        successful_connections += 1;
+                    }
+                    connect_index += retry_count;
+
+                    // Try to restart download
+                    peer_manager.startDownload() catch |retry_err| {
+                        std.debug.print("Failed to restart download: {}\n", .{retry_err});
+                    };
+                }
+
+                last_successful_download_time = current_time;
+            } else {
+                std.debug.print("Maximum retry attempts reached, download may be stuck\n", .{});
+                break;
+            }
+        }
+
+        // Update last successful download time if we made progress
+        if (piece_manager.downloaded_pieces > last_download_count) {
+            last_successful_download_time = current_time;
+            download_retry_count = 0; // Reset retry count on progress
+        }
 
         // Periodically request new peers from the tracker
         if (current_time - last_tracker_time > tracker_update_interval) {

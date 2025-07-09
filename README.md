@@ -9,7 +9,7 @@ A BitTorrent client written in Zig, featuring support for both HTTP and UDP trac
 - HTTP and UDP tracker support
 - BitTorrent peer wire protocol
 - Piece verification with SHA-1 hashing
-- Concurrent downloads from multiple peers
+- Concurrent downloads from multiple peers with simultaneous connections
 - Thread pool for peer management
 - Download progress tracking and metrics
 - Automatic peer discovery and connection management
@@ -58,10 +58,20 @@ zig build test
 - **Bencode**: Parser and serializer for BitTorrent's bencode format
 - **Torrent Parser**: Extracts metadata from .torrent files
 - **Tracker Client**: Communicates with HTTP/UDP trackers to discover peers
-- **Peer Manager**: Manages connections to multiple peers concurrently
+- **Peer Manager**: Manages connections to multiple peers with concurrent connection establishment
 - **Piece Manager**: Handles piece requests, verification, and assembly
 - **File I/O**: Manages writing downloaded data to disk (single/multi-file support)
-- **Thread Pool**: Provides concurrent execution for peer connections
+- **Thread Pool**: Provides concurrent execution for peer connections and management
+
+### Concurrent Connection Features
+
+The peer manager supports both sequential and concurrent peer connections:
+
+- **Sequential Connection**: `connectToPeer()` - connects to peers one by one (legacy behavior)
+- **Concurrent Connection**: `connectToPeersAsync()` - connects to multiple peers simultaneously using thread pool
+- **Convenience Method**: `connectAndStartDownload()` - combines concurrent connection and download initiation
+
+This significantly improves connection establishment time, especially when dealing with many peers.
 
 ## Development
 

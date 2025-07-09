@@ -17,16 +17,16 @@ pub const MessageType = enum(u8) {
 };
 
 pub const PeerMessage = union(enum) {
-    choke: void, // 0
-    unchoke: void, // 1
-    interested: void, // 2
-    not_interested: void, // 3
-    have: u32, // 4
-    bitfield: []const u8, // 5
-    request: struct { index: u32, begin: u32, length: u32 }, // 6
-    piece: struct { index: u32, begin: u32, block: []const u8 }, // 7
-    cancel: struct { index: u32, begin: u32, length: u32 }, // 8
-    keep_alive: void, //
+    choke: void,
+    unchoke: void,
+    interested: void,
+    not_interested: void,
+    have: u32,
+    bitfield: []const u8,
+    request: struct { index: u32, begin: u32, length: u32 },
+    piece: struct { index: u32, begin: u32, block: []const u8 },
+    cancel: struct { index: u32, begin: u32, length: u32 },
+    keep_alive: void,
 
     pub fn deinit(self: *PeerMessage, allocator: Allocator) void {
         switch (self.*) {
@@ -90,16 +90,14 @@ pub const PeerConnection = struct {
         @memcpy(handshake_buffer[28..48], &self.info_hash);
         @memcpy(handshake_buffer[48..68], &self.peer_id);
 
-        // Print info hash for debugging
         std.debug.print("Sending handshake with info_hash: ", .{});
         for (self.info_hash) |b| {
             std.debug.print("{x:0>2}", .{b});
         }
         std.debug.print("\n", .{});
 
-        // Set reasonable timeouts for handshake
-        try self.setReadTimeout(15 * 1000); // 15 second timeout (increased from 10)
-        try self.setWriteTimeout(15 * 1000); // Also set write timeout
+        try self.setReadTimeout(30 * 1000);
+        try self.setWriteTimeout(30 * 1000);
 
         try self.socket.writeAll(&handshake_buffer);
 
@@ -111,7 +109,6 @@ pub const PeerConnection = struct {
             return error.HandshakeFailed;
         }
 
-        // Print received handshake info
         std.debug.print("Received handshake response:\n", .{});
         std.debug.print("  Protocol: {s}\n", .{response[1..20]});
         std.debug.print("  Info hash: ", .{});
@@ -133,9 +130,6 @@ pub const PeerConnection = struct {
 
     pub fn readMessage(self: *PeerConnection) !PeerMessage {
         var length_buf: [4]u8 = undefined;
-        // Read exactly 4 bytes that represent the length prefix. `read` can return fewer
-        // bytes than requested, so loop until we have the full 4-byte prefix (or the
-        // connection closes).
         var read_so_far: usize = 0;
         while (read_so_far < 4) {
             const n = try self.socket.read(length_buf[read_so_far..]);

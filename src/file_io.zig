@@ -1,19 +1,20 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const File = @import("torrent.zig").File;
+const torrent = @import("torrent.zig");
+const file = torrent.File;
 
 pub const FileIO = struct {
     allocator: Allocator,
-    files: []const File,
+    files: []const file,
     file_handles: []std.fs.File,
     piece_length: usize,
 
-    pub fn init(allocator: Allocator, files: []const File, piece_length: usize, output_dir: []const u8) !FileIO {
+    pub fn init(allocator: Allocator, files: []const file, piece_length: usize, output_dir: []const u8) !FileIO {
         var file_handles = try allocator.alloc(std.fs.File, files.len);
         errdefer allocator.free(file_handles);
 
-        for (files, 0..) |file, i| {
-            const file_path = try std.fs.path.join(allocator, &[_][]const u8{ output_dir, file.path });
+        for (files, 0..) |f, i| {
+            const file_path = try std.fs.path.join(allocator, &[_][]const u8{ output_dir, f.path });
             defer allocator.free(file_path);
 
             const dir_path = std.fs.path.dirname(file_path) orelse "";
@@ -41,13 +42,13 @@ pub const FileIO = struct {
         var remaining_data = block;
         var current_offset = piece_index * self.piece_length + begin;
 
-        for (self.files, 0..) |file, i| {
-            if (current_offset >= file.length) {
-                current_offset -= file.length;
+        for (self.files, 0..) |files, i| {
+            if (current_offset >= files.length) {
+                current_offset -= files.length;
                 continue;
             }
 
-            const write_size = @min(file.length - current_offset, remaining_data.len);
+            const write_size = @min(files.length - current_offset, remaining_data.len);
             try self.file_handles[i].seekTo(current_offset);
             try self.file_handles[i].writeAll(remaining_data[0..write_size]);
 

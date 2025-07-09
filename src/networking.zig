@@ -36,6 +36,11 @@ pub const PeerContext = struct {
     peer: *PeerConnection,
 };
 
+pub const ConnectionContext = struct {
+    peer_manager: *PeerManager,
+    address: net.Address,
+};
+
 // PeerManager coordinates connections to multiple peers
 pub const PeerManager = struct {
     allocator: Allocator,
@@ -261,6 +266,45 @@ pub const PeerManager = struct {
         }
     }
 
+    /// Connect to multiple peers concurrently using the thread pool
+    /// This method is much faster than connecting to peers one by one
+    /// Example usage:
+    ///   const peers = try network.parseCompactPeers(allocator, tracker_response.peers);
+    ///   try peer_manager.connectToPeersAsync(peers);
+    pub fn connectToPeersAsync(self: *PeerManager, addresses: []const net.Address) !void {
+        debug.print("Starting concurrent connections to {} peers\n", .{addresses.len});
+
+        if (self.thread_pool == null) {
+            debug.print("Warning: No thread pool available, falling back to sequential connections\n", .{});
+            for (addresses) |address| {
+                self.connectToPeer(address) catch |err| {
+                    debug.print("Failed to connect to peer: {}\n", .{err});
+                    // Continue with other peers even if one fails
+                    continue;
+                };
+            }
+            return;
+        }
+
+        // Submit connection tasks to thread pool
+        for (addresses) |address| {
+            const context = try self.allocator.create(ConnectionContext);
+            context.* = ConnectionContext{
+                .peer_manager = self,
+                .address = address,
+            };
+
+            try self.thread_pool.?.submit(Task{
+                .function = connectionTaskFunction,
+                .context = context,
+            });
+        }
+
+        // Wait a bit for connections to establish
+        std.time.sleep(2000 * std.time.ns_per_ms);
+        debug.print("Concurrent connection phase completed\n", .{});
+    }
+
     // Start downloading pieces from all connected peers
     pub fn startDownload(self: *PeerManager) !void {
         debug.print("Starting download with {} connected peers\n", .{self.peers.items.len});
@@ -294,14 +338,28 @@ pub const PeerManager = struct {
                 });
             }
         } else {
-            // No thread pool, just use the first peer directly
-            debug.print("Using simplified download with first peer\n", .{});
-            var peer = &self.peers.items[0];
-            try peer.sendMessage(.interested);
-
-            // Handle the peer directly
-            try handlePeer(self, peer);
+            // No thread pool, use multi-peer download with failover
+            debug.print("Using multi-peer download with failover\n", .{});
+            try self.startMultiPeerDownload();
         }
+    }
+
+    /// Convenience method: connect to multiple peers concurrently and start download
+    /// This combines connectToPeersAsync() and startDownload() into a single call
+    /// Example usage:
+    ///   const peers = try network.parseCompactPeers(allocator, tracker_response.peers);
+    ///   try peer_manager.connectAndStartDownload(peers);
+    pub fn connectAndStartDownload(self: *PeerManager, addresses: []const net.Address) !void {
+        debug.print("Connecting to {} peers and starting download\n", .{addresses.len});
+
+        // Connect to all peers concurrently
+        try self.connectToPeersAsync(addresses);
+
+        // Give connections a moment to establish
+        std.time.sleep(1000 * std.time.ns_per_ms);
+
+        // Start downloading from all connected peers
+        try self.startDownload();
     }
 
     // Add a new peer to the download process (for newly connected peers)
@@ -332,16 +390,255 @@ pub const PeerManager = struct {
                 .context = context,
             });
         } else {
-            // No thread pool, just handle the peer directly if we're not already downloading
-            if (self.piece_manager.isDownloadComplete()) {
-                debug.print("Download already complete, not adding new peer\n", .{});
-                return;
+            // No thread pool, peer will be handled by multi-peer download system
+            debug.print("Peer added to multi-peer download pool\n", .{});
+        }
+    }
+
+    // Multi-peer download with failover support
+    fn startMultiPeerDownload(self: *PeerManager) !void {
+        debug.print("Starting multi-peer download with {} peers\n", .{self.peers.items.len});
+
+        if (self.thread_pool != null) {
+            // Submit all available peers to the thread pool for concurrent downloading
+            for (self.peers.items) |*peer| {
+                const context = try self.allocator.create(PeerContext);
+                context.* = PeerContext{
+                    .peer_manager = self,
+                    .peer = peer,
+                };
+
+                // Submit the peer handling task to the thread pool
+                try self.thread_pool.?.submit(Task{
+                    .function = peerTaskFunction,
+                    .context = context,
+                });
+            }
+        } else {
+            // No thread pool: handle peers sequentially
+            for (self.peers.items) |*peer| {
+                self.handlePeer(peer) catch |err| {
+                    debug.print("Sequential peer handling failed: {}\n", .{err});
+                    continue;
+                };
+            }
+        }
+
+        // Wait for download completion
+        var check_count: usize = 0;
+        const max_checks = 600; // 10 minutes maximum wait time
+
+        while (!self.piece_manager.isDownloadComplete() and check_count < max_checks) {
+            std.time.sleep(1000 * std.time.ns_per_ms); // Check every second
+            check_count += 1;
+
+            if (check_count % 30 == 0) { // Print status every 30 seconds
+                debug.print("Download still in progress... (check {}/{})\n", .{ check_count, max_checks });
+            }
+        }
+
+        if (self.piece_manager.isDownloadComplete()) {
+            debug.print("Multi-peer download completed successfully\n", .{});
+        } else {
+            debug.print("Download timed out after {} checks\n", .{check_count});
+            return error.DownloadTimeout;
+        }
+    }
+
+    // Try to download with a specific peer, returns error if peer fails
+    fn tryDownloadWithPeer(self: *PeerManager, peer: *PeerConnection) !void {
+        debug.print("Starting download attempt with peer\n", .{});
+
+        // Send interested message
+        peer.sendMessage(.interested) catch |err| {
+            debug.print("Failed to send interested message: {}\n", .{err});
+            return err;
+        };
+
+        // Handle the peer with timeout and error handling
+        self.handlePeerWithTimeout(peer) catch |err| {
+            debug.print("Peer handling failed: {}\n", .{err});
+            return err;
+        };
+    }
+
+    // Handle peer with timeout and better error handling
+    fn handlePeerWithTimeout(self: *PeerManager, peer: *PeerConnection) !void {
+        const start_time = std.time.milliTimestamp();
+        const max_idle_time = 60 * 1000; // 60 seconds max idle time per peer
+        var last_progress_time = start_time;
+        var last_piece_count = self.piece_manager.downloaded_pieces;
+
+        while (!self.piece_manager.isDownloadComplete()) {
+            const current_time = std.time.milliTimestamp();
+
+            // Check if we've made progress recently
+            const current_piece_count = self.piece_manager.downloaded_pieces;
+            if (current_piece_count > last_piece_count) {
+                last_progress_time = current_time;
+                last_piece_count = current_piece_count;
             }
 
-            // Only add the peer if we don't have any active peers
-            if (self.active_peers.load(.monotonic) == 0) {
-                debug.print("No active peers, adding new peer for direct download\n", .{});
-                try handlePeer(self, peer);
+            // If no progress for too long, switch to another peer
+            if (current_time - last_progress_time > max_idle_time) {
+                debug.print("No progress for {} seconds, switching to next peer\n", .{max_idle_time / 1000});
+                return error.PeerTimeout;
+            }
+
+            // Try to handle the peer for a short time
+            if (self.handlePeerBatch(peer)) {
+                // Success, continue with this peer
+                continue;
+            } else |err| {
+                debug.print("Peer batch handling failed: {}\n", .{err});
+                return err;
+            }
+        }
+    }
+
+    // Handle a batch of messages from a peer
+    fn handlePeerBatch(self: *PeerManager, peer: *PeerConnection) !void {
+        const batch_duration = 5000; // 5 seconds per batch
+        const batch_start = std.time.milliTimestamp();
+
+        while (std.time.milliTimestamp() - batch_start < batch_duration and
+            !self.piece_manager.isDownloadComplete())
+        {
+
+            // Try to handle the peer for a short time
+            self.handlePeerShortTerm(peer) catch |err| {
+                if (err == error.PeerDisconnected or err == error.ConnectionReset) {
+                    return err;
+                }
+                // For other errors, just continue
+                continue;
+            };
+        }
+    }
+
+    // Handle peer for a short duration with immediate error handling
+    fn handlePeerShortTerm(self: *PeerManager, peer: *PeerConnection) !void {
+        // This is a simplified version of handlePeer for short-term use
+        _ = self.active_peers.fetchAdd(1, .monotonic);
+        defer {
+            _ = self.active_peers.fetchSub(1, .monotonic);
+        }
+
+        var peer_has_pieces = std.ArrayList(usize).init(self.allocator);
+        defer peer_has_pieces.deinit();
+
+        var is_choked = true;
+        var current_piece: ?usize = null;
+        var message_count: usize = 0;
+        const max_messages = 100; // Limit messages per short-term session
+
+        while (message_count < max_messages and !self.piece_manager.isDownloadComplete()) {
+            // Set short timeout for responsive switching
+            peer.setReadTimeout(1000) catch {}; // 1 second timeout
+
+            var message = peer.readMessage() catch |err| {
+                if (err == error.WouldBlock or err == error.TimedOut) {
+                    // Send keep-alive and continue
+                    peer.sendMessage(.keep_alive) catch {};
+                    if (is_choked) {
+                        peer.sendMessage(.interested) catch {};
+                    }
+                    std.time.sleep(100 * std.time.ns_per_ms);
+                    continue;
+                }
+                return err;
+            };
+            defer message.deinit(self.allocator);
+
+            message_count += 1;
+
+            switch (message) {
+                .unchoke => {
+                    debug.print("Peer unchoked us\n", .{});
+                    is_choked = false;
+
+                    if (current_piece == null) {
+                        current_piece = self.piece_manager.getNextNeededPiece();
+                        if (current_piece) |piece_index| {
+                            self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                debug.print("Failed to request piece: {}\n", .{err});
+                                current_piece = null;
+                            };
+                        }
+                    }
+                },
+                .piece => |piece| {
+                    debug.print("Received block for piece {} (size: {})\n", .{ piece.index, piece.block.len });
+
+                    try self.file_io.writeBlock(piece.index, piece.begin, piece.block);
+                    self.piece_manager.markBlockReceived(piece.index, piece.begin, piece.block);
+
+                    if (self.metrics) |metrics| {
+                        metrics.recordBytesDownloaded(piece.block.len);
+                        try metrics.updateDownloadRate();
+                    }
+
+                    // Request next piece if current one is complete
+                    if (current_piece != null and self.piece_manager.hasPiece(current_piece.?)) {
+                        current_piece = self.piece_manager.getNextNeededPiece();
+                        if (current_piece) |piece_index| {
+                            self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                debug.print("Failed to request next piece: {}\n", .{err});
+                                current_piece = null;
+                            };
+                        }
+                    }
+                },
+                .choke => {
+                    debug.print("Peer choked us\n", .{});
+                    is_choked = true;
+                },
+                .bitfield => |bitfield| {
+                    debug.print("Received bitfield from peer\n", .{});
+
+                    // Parse bitfield to find available pieces
+                    for (0..self.piece_manager.total_pieces) |i| {
+                        const byte_index = i / 8;
+                        if (byte_index >= bitfield.len) break;
+
+                        const bit_index = 7 - @as(u3, @intCast(i % 8));
+                        const has_piece = (bitfield[byte_index] & (@as(u8, 1) << bit_index)) != 0;
+
+                        if (has_piece) {
+                            try peer_has_pieces.append(i);
+                        }
+                    }
+
+                    // If not choked, request a piece
+                    if (!is_choked and current_piece == null) {
+                        for (peer_has_pieces.items) |piece_index| {
+                            if (!self.piece_manager.hasPiece(piece_index)) {
+                                current_piece = piece_index;
+                                self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                                    debug.print("Failed to request piece: {}\n", .{err});
+                                    current_piece = null;
+                                    continue;
+                                };
+                                break;
+                            }
+                        }
+                    }
+                },
+                .have => |piece_index| {
+                    try peer_has_pieces.append(piece_index);
+
+                    if (!is_choked and current_piece == null and !self.piece_manager.hasPiece(piece_index)) {
+                        current_piece = piece_index;
+                        self.piece_manager.requestPiece(peer, piece_index) catch |err| {
+                            debug.print("Failed to request piece: {}\n", .{err});
+                            current_piece = null;
+                        };
+                    }
+                },
+                .keep_alive => {
+                    debug.print("Received keep-alive\n", .{});
+                },
+                else => {},
             }
         }
     }
@@ -353,6 +650,16 @@ pub const PeerManager = struct {
 
         handlePeer(context.peer_manager, context.peer) catch |err| {
             debug.print("Peer task failed: {}\n", .{err});
+        };
+    }
+
+    // Function that handles concurrent peer connections
+    fn connectionTaskFunction(context_ptr: *anyopaque) void {
+        const context = @as(*ConnectionContext, @ptrCast(@alignCast(context_ptr)));
+        defer context.peer_manager.allocator.destroy(context);
+
+        context.peer_manager.connectToPeer(context.address) catch |err| {
+            debug.print("Connection task failed: {}\n", .{err});
         };
     }
 
@@ -529,7 +836,6 @@ pub const PeerManager = struct {
                                         continue;
                                     };
                                     found_piece = true;
-                                    sent_requests += 1;
                                     break;
                                 }
                             }
