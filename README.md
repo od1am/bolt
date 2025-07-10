@@ -1,18 +1,6 @@
-# Bolt BitTorrent Client
+# Bolt
 
-A BitTorrent client written in Zig, featuring support for both HTTP and UDP trackers, multi-file torrents, and concurrent peer connections.
-
-## Features
-
-- Bencode parsing and serialization
-- Torrent file parsing (single and multi-file)
-- HTTP and UDP tracker support
-- BitTorrent peer wire protocol
-- Piece verification with SHA-1 hashing
-- Concurrent downloads from multiple peers with simultaneous connections
-- Thread pool for peer management
-- Download progress tracking and metrics
-- Automatic peer discovery and connection management
+A BitTorrent client implementation  written in Zig.
 
 ## Building
 
@@ -22,12 +10,6 @@ Requirements:
 ```bash
 # Build
 zig build
-
-# Build and run
-zig build run -- <torrent_file> [options]
-
-# Run tests
-zig build test
 ```
 
 ## Usage
@@ -53,28 +35,6 @@ zig build test
 - `--max-peers <num>`: Maximum number of concurrent peer connections (default: 50)
 - `--help`: Show help message
 
-## Architecture
-
-- **Bencode**: Parser and serializer for BitTorrent's bencode format
-- **Torrent Parser**: Extracts metadata from .torrent files
-- **Tracker Client**: Communicates with HTTP/UDP trackers to discover peers
-- **Peer Manager**: Manages connections to multiple peers with concurrent connection establishment
-- **Piece Manager**: Handles piece requests, verification, and assembly
-- **File I/O**: Manages writing downloaded data to disk (single/multi-file support)
-- **Thread Pool**: Provides concurrent execution for peer connections and management
-
-### Concurrent Connection Features
-
-The peer manager supports both sequential and concurrent peer connections:
-
-- **Sequential Connection**: `connectToPeer()` - connects to peers one by one (legacy behavior)
-- **Concurrent Connection**: `connectToPeersAsync()` - connects to multiple peers simultaneously using thread pool
-- **Convenience Method**: `connectAndStartDownload()` - combines concurrent connection and download initiation
-
-This significantly improves connection establishment time, especially when dealing with many peers.
-
-## Development
-
 ### Running Tests
 
 ```bash
@@ -85,22 +45,7 @@ zig build test
 zig test src/bencode.zig
 ```
 
-## Protocol Support
-
-### Trackers
-- HTTP/HTTPS trackers with announce URL
-- UDP trackers with connection protocol
-- Announce-list support for backup trackers
-- Automatic fallback between tracker types
-
-### BitTorrent Protocol
-- Handshake and peer identification
-- Message types: choke, unchoke, interested, have, bitfield, request, piece
-- Block-based piece downloading (16KB blocks)
-- SHA-1 piece verification
-- Keep-alive and timeout handling
-
-## Known Limitations
+## Limitations
 
 - IPv6 peer support is basic
 - No DHT (Distributed Hash Table) support yet
@@ -119,3 +64,7 @@ Contributions are welcome! Please ensure:
 - Tests pass (`zig build test`)
 - New features include appropriate tests
 - Documentation is updated as needed
+
+## References
+- https://wiki.theory.org/BitTorrentSpecification
+- https://bittorrent.org/beps/bep_0000.html

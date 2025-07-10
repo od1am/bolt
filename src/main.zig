@@ -1,16 +1,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const net = std.net;
+const os = std.os;
+
 const cli = @import("cli.zig");
 const config = @import("config.zig");
-const torrent = @import("torrent.zig");
+const FileIO = @import("file_io.zig").FileIO;
+const Metrics = @import("metrics.zig").Metrics;
 const network = @import("networking.zig");
 const PieceManager = @import("piece_manager.zig").PieceManager;
-const FileIO = @import("file_io.zig").FileIO;
+const torrent = @import("torrent.zig");
 const tracker = @import("tracker.zig");
-const Metrics = @import("metrics.zig").Metrics;
-const net = std.net;
-const posix = std.posix;
-const os = std.os;
 
 pub fn main() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -120,21 +120,16 @@ pub fn main() !void {
     var tracker_response: ?tracker.Response = null;
 
     tracker_connect: {
-
-        // Add default trackers if none are found
         var default_trackers = std.ArrayList([]const u8).init(allocator);
         defer default_trackers.deinit();
 
         if (torrent_file.announce_url == null and (torrent_file.announce_list == null or torrent_file.announce_list.?.len == 0)) {
             std.debug.print("No trackers found in torrent file, adding default trackers\n", .{});
-
-            // Add some default trackers - prioritize more reliable ones
-            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.opentrackr.org:1337"));
-            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.openbittorrent.com:80"));
-            try default_trackers.append(try allocator.dupe(u8, "udp://exodus.desync.com:6969"));
-            try default_trackers.append(try allocator.dupe(u8, "udp://open.stealth.si:80"));
-            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.coppersurfer.tk:6969"));
-            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.leechers-paradise.org:6969"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.opentrackr.org:1337/announce"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://exodus.desync.com:6969/announce"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://open.stealth.si:80/announce"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://tracker.torrent.eu.org:451/announce"));
+            try default_trackers.append(try allocator.dupe(u8, "udp://open.tracker.cl:1337/announce"));
 
             // Set as announce list
             torrent_file.announce_list = try default_trackers.toOwnedSlice();
