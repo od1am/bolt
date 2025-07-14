@@ -1,10 +1,11 @@
 const std = @import("std");
 const crypto = std.crypto;
 const Allocator = std.mem.Allocator;
-const PeerMessage = @import("peer_wire.zig").PeerMessage;
-const PeerConnection = @import("peer_wire.zig").PeerConnection;
+
 const FileIO = @import("file_io.zig").FileIO;
 const Metrics = @import("metrics.zig").Metrics;
+const PeerConnection = @import("peer_wire.zig").PeerConnection;
+const PeerMessage = @import("peer_wire.zig").PeerMessage;
 
 const Block = struct {
     data: []u8,

@@ -1,5 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const testing = std.testing;
+
 const config = @import("config.zig");
 
 pub fn parseArgs(allocator: Allocator) !config.Config {
@@ -74,8 +76,6 @@ pub fn parseArgs(allocator: Allocator) !config.Config {
 
     return conf;
 }
-
-const testing = std.testing;
 
 test "parseArgs with help flag" {
     const cfg = @import("config.zig").default_config;

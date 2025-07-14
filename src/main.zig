@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const net = std.net;
+const posix = std.posix;
 const os = std.os;
 
 const cli = @import("cli.zig");

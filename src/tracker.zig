@@ -1,10 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const torrent = @import("torrent.zig");
-const bencode = @import("bencode.zig");
 const StringArrayHashMap = std.StringArrayHashMap;
 const net = std.net;
 const posix = std.posix;
+
+const bencode = @import("bencode.zig");
+const torrent = @import("torrent.zig");
 
 pub const Event = enum {
     none,

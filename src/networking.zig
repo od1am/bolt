@@ -7,14 +7,15 @@ const linux = os.linux;
 const net = std.net;
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
+
+const FileIO = @import("file_io.zig").FileIO;
+const Metrics = @import("metrics.zig").Metrics;
 const PeerConnection = @import("peer_wire.zig").PeerConnection;
 const PieceManager = @import("piece_manager.zig").PieceManager;
-const FileIO = @import("file_io.zig").FileIO;
+const Task = @import("thread_pool.zig").Task;
+const ThreadPool = @import("thread_pool.zig").ThreadPool;
 const TorrentFile = @import("torrent.zig").TorrentFile;
 const tracker_module = @import("tracker.zig");
-const ThreadPool = @import("thread_pool.zig").ThreadPool;
-const Task = @import("thread_pool.zig").Task;
-const Metrics = @import("metrics.zig").Metrics;
 
 const Protocol = enum {
     tcp,
